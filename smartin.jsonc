@@ -1,0 +1,24 @@
+{
+  "version": "0.4.0", // smartin version that wrote this file
+  "eol": "LF",
+  "license": {
+    "copyright": {
+      "name": "Martin Winkler",
+      "year": "2026",
+      "email": false
+    },
+    "spdx": "Apache-2.0",
+    "note": false,
+    "fileHeader": false,
+    "filter": ["*.ts", "*.mjs", "*.cjs"], // gitignore syntax, "!" excludes
+    "packageBanner": true
+  },
+  "export": {
+    "filter": ["*.ts", "package.json", "tsconfig*.json"] // gitignore syntax, "!" excludes
+  },
+  "spec": {
+    "code": ["src/**/*.ts"], // gitignore syntax, "!" excludes
+    "tests": ["tests/**/*.ts"], // gitignore syntax, "!" excludes, false = off
+    "idLength": 4
+  }
+}

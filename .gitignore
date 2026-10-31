@@ -1,0 +1,43 @@
+# General
+.DS_Store
+Thumbs.db
+*.tgz
+*.tar.gz
+
+# Editor
+#.vscode - keep
+.smartin/
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+npm-debug.log*
+yarn-error.log*
+# bun.lock is committed
+
+# Agents
+.agents/
+AGENTS.md
+.claude/
+CLAUDE.md
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Temp
+temp/
+*.temp
+scratch/
+*.scratch
+.cache/
+coverage/
+*.log

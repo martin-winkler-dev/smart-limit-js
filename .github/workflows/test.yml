@@ -1,0 +1,92 @@
+name: Test
+run-name: 'Test: ${{ github.event.pull_request.title || github.event.head_commit.message || github.ref_name }}'
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, Typecheck, and Test (Bun)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: 'package.json'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint:ci
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test & Coverage
+        shell: bash
+        env:
+          NO_COLOR: "1"
+        # bun exits 1 on a missed coverageThreshold without printing why
+        # sed/cat -s: drop bun's empty per-file ::group:: blocks and blank-line runs
+        run: |
+          set -o pipefail
+          bun test --coverage --only-failures 2>&1 | sed -u '/^::\(end\)\?group::/d' | cat -s | tee coverage.txt || {
+            if grep -qE '^ *0 fail' coverage.txt; then
+              MSG="All tests passed, but a file is below [test.coverageThreshold] in bunfig.toml"
+              echo "$MSG" >> coverage.txt
+              echo "::error title=Coverage threshold::$MSG"
+            fi
+            exit 1
+          }
+
+      - name: Create Coverage Summary
+        if: always()
+        run: |
+          if [ -f coverage.txt ]; then
+            echo "### Test Coverage Report" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            sed '/^::/d' coverage.txt | cat -s >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  smoke-node:
+    name: Build and Smoke Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        node-version: ['22.12', '22', '24', '26']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Bun (for building)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: 'package.json'
+
+      - name: Setup Node (for running)
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build and Test Dist
+        run: bun run build && bun run test:dist

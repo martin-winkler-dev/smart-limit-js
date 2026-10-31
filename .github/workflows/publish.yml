@@ -1,0 +1,73 @@
+name: Stage npm release
+run-name: 'Stage ${{ github.ref_name }}: ${{ github.event.head_commit.message }}'
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  stage:
+    name: Stage Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # full history so the tagged commit can be checked against origin/main
+          fetch-depth: 0
+
+      - name: Verify tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME points to $GITHUB_SHA, which is not on main. Merge first, then tag a commit on main."
+            exit 1
+          fi
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: 'package.json'
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          # never let a dependency cache feed into a release
+          package-manager-cache: false
+
+      - name: Verify tag matches package.json version
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $VERSION"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # npm stage needs npm >= 11.15.0; the npm bundled with Node 24 may be older
+      - name: Update npm
+        run: npm install -g npm@^11.15.0
+
+      - name: Check
+        run: bun run check
+
+      - name: Stage release on npm
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG_ARG=""
+          # any semver prerelease (1.0.0-beta.1, 1.0.0-0, ...) goes to "next", never "latest"
+          if [[ "$VERSION" == *-* ]]; then
+            TAG_ARG="--tag next"
+          fi
+          npm stage publish --ignore-scripts $TAG_ARG
+          echo "Staged $NAME@$VERSION. Approve it on npmjs.com or with: npm stage approve $NAME@$VERSION"
