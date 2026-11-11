@@ -15,6 +15,7 @@ export const ERROR_CODES = {
     INVALID_COST: 'A fetched job has a cost that is not an object of non-negative numbers.',
     COST_EXCEEDS_LIMIT: 'The job needs more than a bucket allows in total; it can never run.',
     BUCKET_FAILED: 'A bucket threw or returned an invalid value.',
+    CLOCK_FAILED: 'The clock threw or returned an invalid time; the run was stopped.',
     PROCESS_JOB_THREW: 'processJob() threw instead of returning a result.',
     INVALID_RESULT: 'processJob() returned something other than { ok: true, data } or { ok: false, error }.',
     TIMEOUT: 'processJob() took longer than timeoutMs.',

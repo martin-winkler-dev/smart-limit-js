@@ -9,6 +9,7 @@ import { type ResolvedLimiterOptions, resolveOptions } from './options.js';
 import { createRunState, type LimiterLockState, type QueuedJob, type RunState } from './run-state.js';
 import type {
     AttemptInfo,
+    Clock,
     Cost,
     JobError,
     JobOutcome,
@@ -35,7 +36,9 @@ type Decision<D> = { outcome: JobOutcome<D> | undefined; exceededWaitMs?: number
 
 /** Internal limiter options used by `runAll` and `createQueue`. */
 export type InternalLimiterOptions<J = unknown> = {
+    /** Returns true when caller's job source is exhausted. */
     isSourceDone?: () => boolean;
+    /** Called when run stops, with stop reason and error. */
     onStop?: (reason: StopReason, error: LimiterError | undefined) => void;
     /** Maps internal wrapper job to caller's job in log entries. */
     unwrapJob?: (job: J) => unknown;
@@ -128,7 +131,8 @@ function createConfiguredLimiter<J, D>(
     logger: Logger,
     internal: InternalLimiterOptions<J>,
 ): Limiter {
-    const { buckets, clock } = options;
+    const { buckets } = options;
+    const clock = createSafeClock(options.clock, failForClock);
     let currentRun: RunState<J> | undefined;
     const lock: LimiterLockState = {
         status: 'unlocked',
@@ -140,28 +144,27 @@ function createConfiguredLimiter<J, D>(
         lastStoppedBy: undefined,
     };
 
+    /** Starts limiter execution run. */
     function start(startOptions?: StartOptions): Promise<Result<RunSummary, LimiterError>> {
         if (currentRun) {
             return Promise.resolve({ ok: false, error: createLimiterError('ALREADY_RUNNING') });
         }
         lock.isStoppedByUser = false;
-        if (isObject(startOptions) && startOptions.force === true) {
-            lock.status = 'unlocked';
-            lock.lockedSince = 0;
-            lock.lockUntil = 0;
-            lock.consecutiveFailures = 0;
-        } else if (lock.status !== 'unlocked') {
-            lock.status = 'waiting';
-            lock.lockedSince = clock.now();
-        }
-        lock.epoch++;
 
         return new Promise((resolve) => {
             const run = createRunState<J>(resolve);
-            if (lock.status !== 'unlocked') {
-                run.lockStartedAt = lock.lockedSince;
-            }
+            // Set before first clock read so clock failure ends this run.
             currentRun = run;
+            if (isObject(startOptions) && startOptions.force === true) {
+                lock.status = 'unlocked';
+                lock.lockedSince = 0;
+                lock.lockUntil = 0;
+                lock.consecutiveFailures = 0;
+            } else if (lock.status !== 'unlocked') {
+                lock.status = 'waiting';
+                lock.lockedSince = clock.now();
+            }
+            lock.epoch++;
             logger.log('Limiter started.');
             for (const bucket of buckets) {
                 if (bucket.subscribe) {
@@ -180,6 +183,7 @@ function createConfiguredLimiter<J, D>(
         });
     }
 
+    /** Stops active limiter run, releasing buffered jobs. */
     function stop(stopOptions?: StopOptions): Promise<Result<RunSummary, LimiterError>> {
         lock.isStoppedByUser = true;
         const run = currentRun;
@@ -201,6 +205,7 @@ function createConfiguredLimiter<J, D>(
         });
     }
 
+    /** Signals new jobs to active run; restarts idle limiter when allowed. */
     function wake(): LimiterStatus {
         const run = currentRun;
         if (run) {
@@ -223,10 +228,12 @@ function createConfiguredLimiter<J, D>(
         return !(lock.status === 'waiting' && lock.lockUntil - clock.now() > options.maxWaitMs);
     }
 
+    /** Returns true when no run is active. */
     function isIdle(): boolean {
         return currentRun === undefined;
     }
 
+    /** Returns operational status snapshot. */
     function getStatus(): LimiterStatus {
         const run = currentRun;
         return {
@@ -238,6 +245,7 @@ function createConfiguredLimiter<J, D>(
         };
     }
 
+    /** Maps run and lock state to operational lifecycle state. */
     function getState(run: RunState<J> | undefined): LimiterState {
         if (!run) {
             return 'idle';
@@ -317,6 +325,10 @@ function createConfiguredLimiter<J, D>(
         }
         while (!run.isStopping && run.controllers.size < options.concurrency && lock.status !== 'retrying') {
             const now = clock.now();
+            if (run.isClockFailed) {
+                // Time is stale; the deferred clock failure ends the run.
+                break;
+            }
             const index = run.queue.findIndex((queued) => queued.retryAt <= now && !queued.isHookPending);
             if (index !== -1) {
                 const queued = run.queue[index];
@@ -337,12 +349,12 @@ function createConfiguredLimiter<J, D>(
                     break;
                 }
                 if (!reservation.data.reserved) {
-                    const { waitMs, waitForChange } = reservation.data;
+                    const { waitMs, waitForChange, recheckMs } = reservation.data;
                     if (waitMs > options.maxWaitMs) {
                         stopForMaxWait(run, waitMs);
                         break;
                     }
-                    scheduleWakeUp(run, now, waitMs, waitForChange);
+                    scheduleWakeUp(run, now, recheckMs, waitForChange);
                     break;
                 }
                 run.queue.splice(index, 1);
@@ -378,13 +390,13 @@ function createConfiguredLimiter<J, D>(
                 failRun(run, preCheck.error);
                 break;
             }
-            const { waitMs, waitForChange } = preCheck.data;
+            const { waitMs, waitForChange, recheckMs } = preCheck.data;
             if (waitMs > options.maxWaitMs) {
                 stopForMaxWait(run, waitMs);
                 break;
             }
             if (waitMs > 0 || waitForChange) {
-                scheduleWakeUp(run, now, waitMs, waitForChange);
+                scheduleWakeUp(run, now, recheckMs, waitForChange);
                 break;
             }
             scheduleWakeUp(run, now, Number.POSITIVE_INFINITY);
@@ -401,9 +413,13 @@ function createConfiguredLimiter<J, D>(
         }
     }
 
-    /** Schedules wake-up timer for next bucket window or retry deadline. */
+    /**
+     * **Schedules wake-up timer for next bucket window or retry deadline.**
+     *
+     * - `isWaitingForChange`: `ms` is bucket re-check delay, not a known wait; exempt from `maxWaitMs`
+     */
     function scheduleWakeUp(run: RunState<J>, now: number, ms: number, isWaitingForChange = false): void {
-        let delayMs = isWaitingForChange ? Number.POSITIVE_INFINITY : ms;
+        let delayMs = ms;
         for (const queued of run.queue) {
             if (queued.retryAt > now) {
                 delayMs = Math.min(delayMs, queued.retryAt - now);
@@ -471,8 +487,7 @@ function createConfiguredLimiter<J, D>(
             lastAttempt: undefined,
             isHookPending: false,
             retryAt: 0,
-            firstFailedAt: undefined,
-            lockedMsAtFirstFailure: 0,
+            backoffWaitedMs: 0,
         };
         if (run.isStopping) {
             flushJobs(run, [queued], run.stoppedBy);
@@ -589,8 +604,9 @@ function createConfiguredLimiter<J, D>(
             return undefined;
         }
         const warnAfterMs = Math.min(2 * timeoutMs, MAX_TIMER_MS);
+        // Use raw clock: a failed warning timer must not fail the run with CLOCK_FAILED.
         const started = callSafely(() =>
-            clock.setTimeout(() => {
+            options.clock.setTimeout(() => {
                 logger.warn(
                     `processJob is still running ${warnAfterMs} ms after it started, although timeoutMs (${timeoutMs} ms) aborted its signal; it holds its slot until it settles.`,
                     { job: logJob(queued.job), attempt: queued.attempts },
@@ -630,7 +646,6 @@ function createConfiguredLimiter<J, D>(
             let lockedMs = 0;
             if (lock.status !== 'unlocked' && isCurrentGeneration) {
                 if (result.ok) {
-                    endLockTime(run, now);
                     lock.status = 'unlocked';
                     lock.lockedSince = 0;
                     lock.lockUntil = 0;
@@ -652,23 +667,12 @@ function createConfiguredLimiter<J, D>(
         return decideGlobalBackoff(run, queued, result.error, isCurrentGeneration, now);
     }
 
-    /** Returns cumulative time spent in global locks up to `now`. */
-    function getLockedMs(run: RunState<J>, now: number): number {
-        return run.lockedMs + (run.lockStartedAt === undefined ? 0 : now - run.lockStartedAt);
-    }
-
-    /** Records start of global lock duration. */
-    function startLockTime(run: RunState<J>, now: number): void {
-        run.lockStartedAt = now;
-    }
-
-    /** Accumulates completed global lock duration. */
-    function endLockTime(run: RunState<J>, now: number): void {
-        run.lockedMs = getLockedMs(run, now);
-        run.lockStartedAt = undefined;
-    }
-
-    /** Determines job-specific terminal outcome or schedules individual retry. */
+    /**
+     * **Determines job-specific terminal outcome or schedules individual retry.**
+     *
+     * - `retry_backoff` budget: single delay and sum of all delays of job must fit `maxWaitMs`
+     * - attempt durations, slot or bucket waits and global lock time do not count toward budget
+     */
     function decideJobOutcome(
         run: RunState<J>,
         queued: QueuedJob<J>,
@@ -689,16 +693,11 @@ function createConfiguredLimiter<J, D>(
         let waitMs = 0;
         if (error.type === 'retry_backoff') {
             queued.backoffFailures++;
-            if (queued.firstFailedAt === undefined) {
-                queued.firstFailedAt = now;
-                queued.lockedMsAtFirstFailure = getLockedMs(run, now);
-            }
             waitMs = error.retryAfterMs ?? getBackoffMs(queued.backoffFailures);
-            // Global lock duration does not count toward individual maxWaitMs.
-            const waitedMs = now - queued.firstFailedAt - (getLockedMs(run, now) - queued.lockedMsAtFirstFailure);
-            if (waitMs > options.maxWaitMs || waitedMs + waitMs > options.maxWaitMs) {
+            if (waitMs > options.maxWaitMs || queued.backoffWaitedMs + waitMs > options.maxWaitMs) {
                 return { ok: false, status: 'failed', error: createLimiterError('MAX_WAIT_EXCEEDED', error) };
             }
+            queued.backoffWaitedMs += waitMs;
         }
         if (run.isStopping) {
             return releasedOutcome(run.stoppedBy);
@@ -738,7 +737,6 @@ function createConfiguredLimiter<J, D>(
             if (lock.status === 'unlocked') {
                 lock.lockedSince = now;
                 lock.consecutiveFailures = 1;
-                startLockTime(run, now);
             } else {
                 lock.consecutiveFailures++;
             }
@@ -869,6 +867,10 @@ function createConfiguredLimiter<J, D>(
 
     /** Stops limiter when required wait duration exceeds `maxWaitMs`. */
     function stopForMaxWait(run: RunState<J>, waitMs: number): void {
+        if (run.isClockFailed) {
+            // Wait was computed from stale time; the deferred clock failure ends the run.
+            return;
+        }
         logger.error('MAX_WAIT_EXCEEDED', ERROR_CODES.MAX_WAIT_EXCEEDED, { waitMs, maxWaitMs: options.maxWaitMs });
         requestStop(run, 'max_wait_exceeded');
     }
@@ -880,6 +882,36 @@ function createConfiguredLimiter<J, D>(
         }
         logger.error(error.code, error.message, error.cause);
         requestStop(run, 'stop');
+    }
+
+    /**
+     * **Fails current run after clock failure**: once per run, with `CLOCK_FAILED`.
+     *
+     * - run error set at once, so run also reports failure when it ends before the deferred stop
+     * - stop deferred to microtask: clock is read in the middle of dispatch and settle code, which must finish first
+     * - no run active: logs only
+     */
+    function failForClock(cause: unknown): void {
+        const run = currentRun;
+        const error = createLimiterError('CLOCK_FAILED', cause);
+        if (!run) {
+            logger.error(error.code, error.message, cause);
+            return;
+        }
+        if (run.isClockFailed) {
+            return;
+        }
+        run.isClockFailed = true;
+        if (!run.isStopping) {
+            run.error = error;
+        }
+        queueMicrotask(() => {
+            if (currentRun === run) {
+                failRun(run, error);
+            } else {
+                logger.error(error.code, error.message, cause);
+            }
+        });
     }
 
     /** Checks completion conditions and resolves active run promises. */
@@ -962,4 +994,37 @@ function createConfiguredLimiter<J, D>(
     lockStates.set(limiter, lock);
     jobReleasers.set(limiter, releaseQueuedJob);
     return limiter;
+}
+
+/**
+ * **Wraps clock so no call throws**: failures go to `onFailure`, caller continues with fallback.
+ *
+ * - `now`: throw or non-finite value is failure; returns last valid time (`0` before first)
+ * - `setTimeout`: throw is failure; returns `undefined` (no timer armed)
+ * - `clearTimeout`: throw ignored; timer firing late is harmless
+ */
+function createSafeClock(clock: Clock, onFailure: (cause: unknown) => void): Clock {
+    let lastNow = 0;
+    return {
+        now() {
+            const read = callSafely(() => clock.now());
+            if (read.ok && typeof read.data === 'number' && Number.isFinite(read.data)) {
+                lastNow = read.data;
+            } else {
+                onFailure(read.ok ? read.data : read.error);
+            }
+            return lastNow;
+        },
+        setTimeout(callback, ms) {
+            const started = callSafely(() => clock.setTimeout(callback, ms));
+            if (!started.ok) {
+                onFailure(started.error);
+                return undefined;
+            }
+            return started.data;
+        },
+        clearTimeout(timer) {
+            callSafely(() => clock.clearTimeout(timer));
+        },
+    };
 }

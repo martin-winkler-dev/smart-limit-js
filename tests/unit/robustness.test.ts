@@ -7,7 +7,9 @@ import {
     createBucket,
     createConcurrencyBucket,
     createLimiter,
+    createQueue,
     createRPM,
+    createSlidingWindow,
     type FetchedJob,
     type JobResult,
     type LimiterOptions,
@@ -29,6 +31,18 @@ function source(count: number) {
             fetches++;
             return next <= count ? { job: next++ } : null;
         },
+    };
+}
+
+/** Source yielding one entry then null. */
+function once(entry: FetchedJob<number>) {
+    let isFetched = false;
+    return (): FetchedJob<number> | null => {
+        if (isFetched) {
+            return null;
+        }
+        isFetched = true;
+        return entry;
     };
 }
 
@@ -229,6 +243,174 @@ describe('limiters sharing buckets', () => {
             [2, 10_000],
         ]);
         expect(startsB.map(([, at]) => at)).toEqual([0, 1_000, 2_000, 3_000, 4_000]);
+    });
+});
+
+describe('attempts that run longer than a sliding window', () => {
+    it.each([
+        ['no wake()', undefined],
+        ['wake() after the window passed', 1_500],
+        ['wake() shortly before the attempts settle', 4_900],
+    ])('starts the next job one window after the attempts settle: %s', async (_name, wakeAt) => {
+        const clock = createFakeClock();
+        const starts: [number, number][] = [];
+        const limiter = createLimiter<number, number>({
+            clock,
+            concurrency: 3,
+            buckets: [createSlidingWindow({ requests: 2, perMs: 1_000 })],
+            fetchJob: source(3).fetchJob,
+            processJob: async (job) => {
+                starts.push([job, clock.now()]);
+                await sleep(clock, 5_000);
+                return { ok: true, data: job };
+            },
+        });
+        const run = limiter.start();
+        if (wakeAt !== undefined) {
+            await clock.advance(wakeAt);
+            limiter.wake();
+        }
+        const result = await clock.settle(run);
+        expect(result).toEqual({ ok: true, data: { done: 3, failed: 0, released: 0, stoppedBy: 'empty' } });
+        // Both requests are booked at 5,000; a start before 6,000 would put three requests into one window.
+        expect(starts).toEqual([
+            [1, 0],
+            [2, 0],
+            [3, 6_000],
+        ]);
+    });
+
+    it('starts a job waiting on a shared window when the long attempt of another limiter settles below its estimate', async () => {
+        const clock = createFakeClock();
+        const shared = createSlidingWindow({ tokens: 100, perMs: 1_000 });
+        const starts: [string, number][] = [];
+        const a = createLimiter<number, number>({
+            clock,
+            buckets: [shared],
+            fetchJob: once({ job: 1, cost: { tokens: 100 } }),
+            processJob: async (job) => {
+                starts.push(['a', clock.now()]);
+                await sleep(clock, 30_000);
+                return { ok: true, data: job, usage: { tokens: 10 } };
+            },
+        });
+        const b = createLimiter<number, number>({
+            clock,
+            buckets: [shared],
+            fetchJob: once({ job: 2, cost: { tokens: 90 } }),
+            processJob: (job) => {
+                starts.push(['b', clock.now()]);
+                return { ok: true, data: job };
+            },
+        });
+        const runs = Promise.all([a.start(), b.start()]);
+        await clock.advance(1_500);
+        // The reservation of a is older than the window: a re-check must not let b start.
+        b.wake();
+        await clock.advance(28_499);
+        expect(starts).toEqual([['a', 0]]);
+        expect(b.getStatus()).toMatchObject({ state: 'running', buffered: 1 });
+        await clock.settle(runs);
+        // a held 100 until it settled with 10: the 90 of b fit at once.
+        expect(starts).toEqual([
+            ['a', 0],
+            ['b', 30_000],
+        ]);
+    });
+
+    it('starts a waiting job when a settled booking expires while a long attempt is still in flight', async () => {
+        const clock = createFakeClock();
+        const starts: [string, number][] = [];
+        const entries = [
+            { job: 'long', cost: { tokens: 60 } },
+            { job: 'short', cost: { tokens: 40 } },
+            { job: 'third', cost: { tokens: 40 } },
+        ];
+        const limiter = createLimiter<string, string>({
+            clock,
+            concurrency: 3,
+            buckets: [createSlidingWindow({ tokens: 100, perMs: 1_000 })],
+            fetchJob: () => entries.shift() ?? null,
+            processJob: async (job) => {
+                starts.push([job, clock.now()]);
+                await sleep(clock, job === 'long' ? 10_000 : 100);
+                return { ok: true, data: job };
+            },
+        });
+        const result = await clock.settle(limiter.start());
+        expect(result).toEqual({ ok: true, data: { done: 3, failed: 0, released: 0, stoppedBy: 'empty' } });
+        // 'short' is booked at 100 and leaves the window at 1,100; no settle happens until 10,000.
+        expect(starts).toEqual([
+            ['long', 0],
+            ['short', 0],
+            ['third', 1_100],
+        ]);
+    });
+
+    it('does not let a hung attempt of another limiter block capacity that expired bookings free', async () => {
+        const clock = createFakeClock();
+        const shared = createSlidingWindow({ tokens: 100, perMs: 1_000 });
+        const hung = createLimiter<number, number>({
+            clock,
+            buckets: [shared],
+            fetchJob: once({ job: 0, cost: { tokens: 60 } }),
+            processJob: () => new Promise<never>(() => {}),
+        });
+        const starts: [number, number][] = [];
+        const jobs = source(2);
+        const limiter = createLimiter<number, number>({
+            clock,
+            buckets: [shared],
+            fetchJob: () => {
+                const fetched = jobs.fetchJob();
+                return fetched && { ...fetched, cost: { tokens: 40 } };
+            },
+            processJob: (job) => {
+                starts.push([job, clock.now()]);
+                return { ok: true, data: job };
+            },
+        });
+        void hung.start();
+        const result = await clock.settle(limiter.start());
+        expect(result).toEqual({ ok: true, data: { done: 2, failed: 0, released: 0, stoppedBy: 'empty' } });
+        // 60 stay reserved by the hung attempt; the 40 of job 1 leave the window at 1,000.
+        expect(starts).toEqual([
+            [1, 0],
+            [2, 1_000],
+        ]);
+    });
+
+    it('does not count the re-check delay toward maxWaitMs: an in-flight attempt may free capacity earlier', async () => {
+        const clock = createFakeClock();
+        const starts: [string, number][] = [];
+        const entries = [
+            { job: 'settled', cost: { tokens: 40 } },
+            { job: 'in flight', cost: { tokens: 60 } },
+            { job: 'waiting', cost: { tokens: 40 } },
+        ];
+        const limiter = createLimiter<string, string>({
+            clock,
+            concurrency: 3,
+            maxWaitMs: 1_000,
+            // Settled bookings expire after a day, far beyond maxWaitMs.
+            buckets: [createSlidingWindow({ tokens: 100, perMs: 86_400_000 })],
+            fetchJob: () => entries.shift() ?? null,
+            processJob: async (job) => {
+                starts.push([job, clock.now()]);
+                if (job !== 'in flight') {
+                    return { ok: true, data: job };
+                }
+                await sleep(clock, 5_000);
+                return { ok: true, data: job, usage: { tokens: 10 } };
+            },
+        });
+        const result = await clock.settle(limiter.start());
+        expect(result).toEqual({ ok: true, data: { done: 3, failed: 0, released: 0, stoppedBy: 'empty' } });
+        expect(starts).toEqual([
+            ['settled', 0],
+            ['in flight', 0],
+            ['waiting', 5_000],
+        ]);
     });
 });
 
@@ -656,4 +838,210 @@ describe('fetched entries that throw while read', () => {
             expect(limiter.isIdle()).toBe(true);
         });
     }
+});
+
+describe('a clock that fails', () => {
+    /** Fake clock whose methods can be broken one by one while a run is active. */
+    function breakableClock() {
+        const fake = createFakeClock();
+        const broken: { now?: () => number; setTimeout?: boolean; clearTimeout?: boolean } = {};
+        const clock: Clock = {
+            now: () => (broken.now ? broken.now() : fake.now()),
+            setTimeout(callback, ms) {
+                if (broken.setTimeout) {
+                    throw new Error('setTimeout broke');
+                }
+                return fake.setTimeout(callback, ms);
+            },
+            clearTimeout(timer) {
+                if (broken.clearTimeout) {
+                    throw new Error('clearTimeout broke');
+                }
+                fake.clearTimeout(timer);
+            },
+        };
+        return { fake, broken, clock };
+    }
+
+    function throwingNow(): number {
+        throw new Error('now broke');
+    }
+
+    it.each([
+        ['throws', throwingNow, new Error('now broke')],
+        ['returns NaN', () => Number.NaN, Number.NaN],
+        ['returns Infinity', () => Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],
+        ['returns a non-number', () => '5' as never, '5'],
+    ])('resolves start() with CLOCK_FAILED when now() %s, without fetching a job', async (_name, now, cause) => {
+        const { fake, broken, clock } = breakableClock();
+        broken.now = now;
+        const outcomes: [number, string][] = [];
+        const limiter = createLimiter<number, number>({
+            clock,
+            fetchJob: source(3).fetchJob,
+            processJob: (job) => ({ ok: true, data: job }),
+            onJobDone: (job, outcome) => {
+                outcomes.push([job, outcome.ok ? 'done' : outcome.error.code]);
+            },
+        });
+        let result: unknown;
+        const unhandled = await collectUnhandledRejections(async () => {
+            result = await fake.settle(limiter.start());
+        });
+        expect(unhandled).toEqual([]);
+        expect(result).toEqual({ ok: false, error: { code: 'CLOCK_FAILED', message: expect.any(String), cause } });
+        // No job is leased with a clock that gives no time.
+        expect(outcomes).toEqual([]);
+        expect(limiter.getStatus()).toMatchObject({ state: 'idle', lastStoppedBy: 'error' });
+
+        // The limiter works again once the clock does.
+        broken.now = undefined;
+        expect(await fake.settle(limiter.start())).toEqual({
+            ok: true,
+            data: { done: 3, failed: 0, released: 0, stoppedBy: 'empty' },
+        });
+    });
+
+    it('reports CLOCK_FAILED, not max_wait_exceeded, when now() fails while the limiter is locked', async () => {
+        const { fake, broken, clock } = breakableClock();
+        let calls = 0;
+        const limiter = createLimiter<number, number>({
+            clock,
+            maxWaitMs: 1_000,
+            concurrency: 1,
+            fetchJob: source(2).fetchJob,
+            processJob: (job): JobResult<number> =>
+                calls++ === 0
+                    ? { ok: false, error: { type: 'backoff_global', message: 'down', retryAfterMs: 5_000 } }
+                    : { ok: true, data: job },
+        });
+        // Locks the limiter until 5,000; the lock outlasts the run, which hands back job 1.
+        expect(await fake.settle(limiter.start())).toEqual({
+            ok: true,
+            data: { done: 0, failed: 0, released: 1, stoppedBy: 'max_wait_exceeded' },
+        });
+        await fake.advance(10_000);
+        // The lock has passed, but the last valid time still lies inside it.
+        broken.now = throwingNow;
+        expect(await fake.settle(limiter.start())).toMatchObject({ ok: false, error: { code: 'CLOCK_FAILED' } });
+        broken.now = undefined;
+        expect(await fake.settle(limiter.start())).toEqual({
+            ok: true,
+            data: { done: 1, failed: 0, released: 0, stoppedBy: 'empty' },
+        });
+    });
+
+    it('ends the run when now() starts to throw while attempts are in flight: attempts finish and free their bucket slots', async () => {
+        const { fake, broken, clock } = breakableClock();
+        const shared = createConcurrencyBucket(2);
+        const window = createSlidingWindow({ tokens: 100, perMs: 1_000 });
+        const outcomes: [number, string][] = [];
+        const logs: string[] = [];
+        const limiter = createLimiter<number, number>({
+            clock,
+            concurrency: 2,
+            buckets: [shared, window],
+            fetchJob: () => {
+                const fetched = jobs.fetchJob();
+                return fetched && { ...fetched, cost: { tokens: 50 } };
+            },
+            processJob: async (job) => {
+                await sleep(fake, 1_000);
+                return { ok: true, data: job };
+            },
+            onJobDone: (job, outcome) => {
+                outcomes.push([job, outcome.ok ? 'done' : outcome.error.code]);
+            },
+            log: (entry) => {
+                if (entry.code === 'CLOCK_FAILED') {
+                    logs.push(entry.code);
+                }
+            },
+        });
+        const jobs = source(4);
+        let result: unknown;
+        const unhandled = await collectUnhandledRejections(async () => {
+            const run = limiter.start();
+            await fake.advance(500);
+            expect(limiter.getStatus()).toMatchObject({ running: 2 });
+            broken.now = throwingNow;
+            result = await fake.settle(run);
+        });
+        expect(unhandled).toEqual([]);
+        expect(result).toMatchObject({ ok: false, error: { code: 'CLOCK_FAILED', cause: new Error('now broke') } });
+        // Both running attempts finish; jobs 3 and 4 are never fetched.
+        expect(outcomes).toEqual([
+            [1, 'done'],
+            [2, 'done'],
+        ]);
+        expect(jobs.fetches).toBe(2);
+        // Reported once, although every later clock read fails as well.
+        expect(logs).toEqual(['CLOCK_FAILED']);
+        expect(limiter.isIdle()).toBe(true);
+        // No leaked reservation: another limiter can use both slots and the settled window.
+        expect(shared.getWaitMs({ requests: 1 }, 0)).toBe(0);
+        const second = shared.reserve({ requests: 1 }, 0);
+        expect(shared.getWaitMs({ requests: 1 }, 0)).toBe(0);
+        shared.settle(second, {}, 0);
+        expect(window.getWaitMs({ tokens: 1 }, 10_000)).toBe(0);
+    });
+
+    it('fails the run instead of hanging when setTimeout throws for a wake-up timer', async () => {
+        const { fake, broken, clock } = breakableClock();
+        broken.setTimeout = true;
+        const started: number[] = [];
+        const limiter = createLimiter<number, number>({
+            clock,
+            // Job 2 needs a timer for the window wait.
+            buckets: [createRPM(1)],
+            fetchJob: source(2).fetchJob,
+            processJob: (job) => {
+                started.push(job);
+                return { ok: true, data: job };
+            },
+        });
+        const result = await fake.settle(limiter.start());
+        expect(result).toMatchObject({
+            ok: false,
+            error: { code: 'CLOCK_FAILED', cause: new Error('setTimeout broke') },
+        });
+        expect(started).toEqual([1]);
+        expect(limiter.isIdle()).toBe(true);
+    });
+
+    it('finishes the run when only clearTimeout throws', async () => {
+        const { fake, broken, clock } = breakableClock();
+        broken.clearTimeout = true;
+        const limiter = createLimiter<number, number>({
+            clock,
+            buckets: [createSlidingWindow({ requests: 1, perMs: 1_000 })],
+            timeoutMs: 5_000,
+            fetchJob: source(3).fetchJob,
+            processJob: async (job) => {
+                await sleep(fake, 100);
+                return { ok: true, data: job };
+            },
+        });
+        expect(await fake.settle(limiter.start())).toEqual({
+            ok: true,
+            data: { done: 3, failed: 0, released: 0, stoppedBy: 'empty' },
+        });
+    });
+
+    it('resolves every push of a queue with CLOCK_FAILED instead of rejecting or hanging', async () => {
+        const { fake, broken, clock } = breakableClock();
+        broken.now = throwingNow;
+        const queue = createQueue<number, number>({
+            clock,
+            concurrency: 1,
+            processJob: (job) => ({ ok: true, data: job }),
+        });
+        const outcomes = await fake.settle(Promise.all([queue.push(1), queue.push(2)]));
+        expect(outcomes.map((outcome) => [outcome.status, !outcome.ok && outcome.error.code])).toEqual([
+            ['released', 'CLOCK_FAILED'],
+            ['released', 'CLOCK_FAILED'],
+        ]);
+        broken.now = undefined;
+        expect(await fake.settle(queue.push(3))).toEqual({ ok: true, status: 'done', data: 3 });
+    });
 });

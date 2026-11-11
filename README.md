@@ -22,9 +22,9 @@ ESM package with TypeScript types for Node.js >= 22.12 (`require()` supported) a
 
 | Use Case | Entry Point | Behavior |
 |---|---|---|
-| Database or external queue with persistent jobs | `createLimiter({ fetchJob, processJob, onJobDone })` | Pulls jobs on demand; caller persists outcomes; see [External store integration](#external-store-integration) |
-| Static array of items | `runAll(items, options)` | Batch execution preserving input order; see [A fixed list](#a-fixed-list) |
-| Independent callers awaiting individual results (API wrapper) | `createQueue(options)` and `push(job)` | In-memory priority queue; see [A queue in memory](#a-queue-in-memory) |
+| Database or external queue with persistent jobs | `createLimiter({ fetchJob, processJob, onJobDone })` | Pulls jobs on demand; caller persists outcomes; see [External Store Integration](#external-store-integration) |
+| Static array of items | `runAll(items, options)` | Batch execution preserving input order; see [A Fixed List](#a-fixed-list) |
+| Independent callers awaiting individual results (API wrapper) | `createQueue(options)` and `push(job)` | In-memory priority queue; see [A Queue in Memory](#a-queue-in-memory) |
 
 All three entry points share the same options, bucket engine, and error classification.
 
@@ -58,7 +58,7 @@ const limiter = createLimiter({
         if (!job) return null;
         return { job, cost: { tokens: Math.ceil(job.text.length / 4) + 300 } };
     },
-    // One attempt; classify every error (see "Classifying errors" below)
+    // One attempt; classify every error (see "Classifying Errors" below)
     processJob: async (job, { signal }) => {
         try {
             const res = await sdk.generate(job.text, { signal });
@@ -68,9 +68,9 @@ const limiter = createLimiter({
         }
     },
     onAttempt: (job, result, info) => logAttempt(job, result, info),
-    onJobDone: async (job, result) => {
-        if (result.status === 'done') await markDone(job.id, result.data);
-        else if (result.status === 'failed') await markFailed(job.id, result.error);
+    onJobDone: async (job, outcome) => {
+        if (outcome.status === 'done') await markDone(job.id, outcome.data);
+        else if (outcome.status === 'failed') await markFailed(job.id, outcome.error);
         else await markOpen(job.id); // 'released' on stop() or max_wait_exceeded
     },
     log: ({ level, message, data }) => console[level](message, data ?? ''),
@@ -111,11 +111,12 @@ State resides in memory; the external store owns persistence and leasing:
 - **Cost validation:** Each job defaults to `{ requests: 1, ...cost }` from `fetchJob`. Buckets read only their assigned unit key. Invalid costs fail with `INVALID_COST`; costs exceeding total bucket capacity fail with `COST_EXCEEDS_LIMIT`.
 - **Settlement:** When an attempt completes, actual `usage` merges over reserved cost per unit (`{ ...cost, ...usage }`, keeping reserved amounts for omitted units; invalid `usage` is ignored). If usage exceeds the limit, the window throttles subsequent starts until excess capacity rolls out -- even for jobs requiring 0 units.
 - **Settlement timestamp:** Usage is booked at completion and expires `perMs` after completion, not start. This matches provider accounting for long-running calls and avoids boundary 429s.
-- **In-flight credit:** When computing wait times, sliding windows credit in-flight reservations as pending capacity. If pending attempts cover the shortfall, the bucket returns `WAIT_FOR_CHANGE` instead of a static sleep timer, preventing spurious `maxWaitMs` halts on daily windows.
+- **In-flight credit:** When computing wait times, sliding windows credit in-flight reservations as pending capacity. If pending attempts cover the shortfall, the bucket returns `WAIT_FOR_CHANGE` instead of a static sleep timer, preventing spurious `maxWaitMs` halts on daily windows. The limiter also schedules a timed re-check for when settled usage expires and frees enough room alongside in-flight reservations; that re-check delay does not count toward `maxWaitMs`.
+- **In-flight reservations never expire:** A reservation counts toward the window from start until its attempt settles, even when the attempt runs longer than `perMs`. A `processJob` that never settles holds its reserved amount in every limiter sharing the bucket; set `timeoutMs` and honor `signal`.
 - **Startup offset:** The `used` option seeds prior usage (e.g. from logs):
   `createTPD(5_000_000, { used: [{ at: timestamp, amount: tokens }, ...] })` (`amount` defaults to `1`) or `{ used: 350_000 }` (booked on the first check).
-- **Shared buckets:** Passing the same bucket instance to multiple limiters enforces a shared quota. `createConcurrencyBucket(n)` coordinates global concurrency across limiters. Capacity notifications cycle through limiters via round-robin distribution.
-- **Custom & event-driven buckets:** `createBucket({ getWaitMs(cost, now), reserve(cost, now), settle(reservation, actualCost, now), subscribe(onChange) })` defines custom buckets (all hooks optional). `getWaitMs` returns `0` (ready), `> 0` (wait ms), `Infinity` (exceeds limit), or `WAIT_FOR_CHANGE` (`-1`, exported from `'smart-limit'`) when blocked on external events; the limiter subscribes via `subscribe(onChange)` (which returns an unsubscribe function) and re-checks when notified. Reservations across multiple buckets are atomic: capacity is reserved only when all buckets return `0`, and partial reservations roll back via `settle(reservation, {}, now)` if a later `reserve` throws.
+- **Shared buckets:** Passing the same bucket instance to multiple limiters enforces a shared quota. `createConcurrencyBucket(n)` coordinates global concurrency across limiters. Built-in buckets notify subscribed limiters in round-robin order, advancing the starting subscriber after each reservation so settle-freed capacity is shared fairly.
+- **Custom & event-driven buckets:** `createBucket({ getWaitMs(cost, now), reserve(cost, now), settle(reservation, actualCost, now), subscribe(onChange) })` defines custom buckets (all hooks optional). `getWaitMs` returns `0` (ready), `> 0` (wait ms), `Infinity` (exceeds limit), or `WAIT_FOR_CHANGE` (`-1`, exported from `'smart-limit'`) when blocked on external events; the limiter subscribes via `subscribe(onChange)` (which returns an unsubscribe function) and re-checks when notified. A custom bucket receives no timed re-check while returning `WAIT_FOR_CHANGE`, so it must notify via `subscribe` when capacity opens by time alone. Reservations across multiple buckets are atomic: capacity is reserved only when all buckets return `0`, and partial reservations roll back via `settle(reservation, {}, now)` if a later `reserve` throws.
 - **Configuration errors:** Buckets created with invalid options expose `configError` (e.g. `createLimiterError('INVALID_CONFIG', message)`), resolving `start()` with `INVALID_CONFIG` without throwing.
 
 ## Results and Errors
@@ -136,7 +137,7 @@ type JobError = {
 | Error `type` | Limiter Action | Semantics & Usage |
 |---|---|---|
 | `backoff_global` | Global lock & single probe | Locks all concurrency slots for `retryAfterMs` (used as given if `> 0`; else exponential backoff with a 1_000 ms floor, even if `retryDelayMs: 0`). Concurrent failures from the same in-flight wave only extend `lockUntil` if `retryAfterMs` is longer; stale failures from before an unlock re-queue without re-locking. Dispatches one probe job (`queue[0]`); only `ok: true` unlocks slots. Bounded by `maxWaitMs` (does not consume `maxRetries`). Intended exclusively for provider outages or rate limits (429, 503, network drop). |
-| `retry_backoff` | Isolated delayed retry | Retries only that job after `retryAfterMs` (or exponential backoff; immediate if `retryDelayMs: 0`), up to `maxRetries`. Fails with `MAX_WAIT_EXCEEDED` if wait exceeds `maxWaitMs` (global lock duration excluded). Other slots continue running. |
+| `retry_backoff` | Isolated delayed retry | Retries only that job after `retryAfterMs` (or exponential backoff; immediate if `retryDelayMs: 0`), up to `maxRetries`. Fails with `MAX_WAIT_EXCEEDED` if a single delay or the cumulative backoff delay of the job exceeds `maxWaitMs`. Other slots continue running. |
 | `retry_immediate` | Isolated immediate retry | Retries only that job immediately (`retryAt = 0`), up to `maxRetries`, without advancing its backoff exponent. Other slots continue running. |
 | `fatal` | Permanent failure | No retry. Job settles immediately; `onJobDone` receives `{ ok: false, status: 'failed', error }`. |
 
@@ -235,6 +236,7 @@ Over-reporting usage delays subsequent starts until the window rolls forward; un
 - Exceptions in callbacks (`processJob`, `fetchJob`, hooks, logger) never crash the process.
 - Throws or invalid returns in `fetchJob` (`FETCH_FAILED`) or in bucket `getWaitMs`, `reserve`, or `subscribe` (`BUCKET_FAILED`) halt new dispatches, release buffered jobs (`STOPPED`), await active attempts, and resolve the run with `{ ok: false, error }` (`lastStoppedBy: 'error'`).
 - Throws or async rejections in `bucket.settle` or `unsubscribe` log `BUCKET_FAILED` while execution continues.
+- A custom `clock` whose `now()` throws or returns a non-finite number, or whose `setTimeout()` throws when scheduling a wake-up or lock timer, halts the run the same way with `CLOCK_FAILED` (`clearTimeout()` throws and per-attempt timeout timer throws are ignored).
 - All errors are structured objects `{ code, message, cause? }` matching `ERROR_CODES`.
 
 ## Options
@@ -245,7 +247,7 @@ Over-reporting usage delays subsequent starts until the window rolls forward; un
 | `processJob` | *(required)* | `(job, context) => Awaitable<JobResult>` | Executes a single attempt. `context` provides `{ attempt, signal }` (`attempt` starts at `1`). |
 | `buckets` | `[]` | `readonly Bucket[]` | Passive rate limit buckets evaluated before each attempt. |
 | `concurrency` | `5` | Integer `>= 1` or `Infinity` | Maximum concurrent jobs in flight. `Infinity` relies strictly on buckets. |
-| `maxBufferSize` | `concurrency` (`Infinity` in `createQueue`) | Integer `>= 1` or `Infinity` | Maximum retrying jobs held in buffer before pausing `fetchJob()`. |
+| `maxBufferSize` | `concurrency` (`Infinity` in `createQueue`) | Integer `>= 1` or `Infinity` | Maximum buffered jobs waiting to run or retry before pausing `fetchJob()`. |
 | `maxRetries` | `4` | Integer `>= 0` | Maximum retries per job for `retry_backoff` and `retry_immediate`. |
 | `retryDelayMs` | `2_000` | Finite number `>= 0` | Initial exponential backoff delay (doubles: 2s, 4s, 8s...). `0` retries immediately. Minimum global backoff is 1_000 ms. |
 | `maxRetryDelayMs` | `300_000` (5 min) | Finite number `>= 0` | Ceiling on computed exponential backoff delay. |
@@ -265,9 +267,9 @@ Over-reporting usage delays subsequent starts until the window rolls forward; un
 | Single timed bucket wait (e.g. daily quota exhausted) | Checked prior to `fetchJob` and for each buffered job | Halts the run (`stoppedBy: 'max_wait_exceeded'`) |
 | `retryAfterMs` on `backoff_global` | Checked when error is returned | Halts the run (`stoppedBy: 'max_wait_exceeded'`) |
 | Global lock duration without a successful probe | Measured continuously from the start of the lock | Halts the run (`stoppedBy: 'max_wait_exceeded'`) |
-| Isolated job `retry_backoff` wait | Single delay or cumulative backoff time (excluding global lock duration) | Fails only that job (`MAX_WAIT_EXCEEDED`) |
+| Isolated job `retry_backoff` wait | Single delay or sum of the job's backoff delays (attempt duration, slot or bucket waits, and global lock duration excluded) | Fails only that job (`MAX_WAIT_EXCEEDED`) |
 | Multiple independent bucket waits that individually fit | Sequential checks | Waits are not cumulative; run continues |
-| Concurrency slot or `WAIT_FOR_CHANGE` capacity | Waiting for in-flight requests to complete | Never counts toward `maxWaitMs`; bounded by `timeoutMs` |
+| Concurrency slot or `WAIT_FOR_CHANGE` capacity | Waiting for in-flight requests to complete | Never counts toward `maxWaitMs`; bounded by `timeoutMs` when `processJob` honors `signal` |
 
 When a run stops for `maxWaitMs` (`stoppedBy: 'max_wait_exceeded'`):
 
@@ -289,7 +291,7 @@ When a run stops for `maxWaitMs` (`stoppedBy: 'max_wait_exceeded'`):
   type LimiterStatus = {
       state: 'idle' | 'running' | 'locked' | 'probing' | 'stopping';
       running: number;        // Attempts currently in flight
-      buffered: number;       // Jobs waiting in internal retry buffer
+      buffered: number;       // Jobs waiting in internal buffer (to run or retry)
       lockUntil: number;      // Expiration timestamp of global lock (0 if unlocked/probing)
       lastStoppedBy: 'empty' | 'stop' | 'max_wait_exceeded' | 'error' | undefined;
   };
@@ -328,6 +330,7 @@ if (result.ok) {
 - **Unstarted items:** Unstarted items in a stopped or failed run are released with `STOPPED` or `MAX_WAIT_EXCEEDED` (`attempt: 0`). Optional `onJobDone` is invoked for every item.
 - **External abort:** Passing `signal` triggers an immediate stop (`stop({ abort: true })`), aborting in-flight attempts.
 - **Error containment:** If execution fails (e.g. `BUCKET_FAILED`), `runAll` returns `{ ok: false, error, data }`, retaining outcomes for all processed items. Only `INVALID_CONFIG` returns without `data`. Never rejects.
+- **Item validation:** Every defined item must be an object with a `job` property (`runAll(prompts, ...)` with raw values resolves with `INVALID_CONFIG` before any job runs). Sparse array holes run with `job: undefined`.
 
 ## A Queue in Memory
 
@@ -363,7 +366,8 @@ async function generate(prompt: string, signal?: AbortSignal) {
 - **Automatic execution:** Pushing starts the limiter automatically if idle (including after `stop()` or `max_wait_exceeded`). When empty, the run ends immediately.
 - **Per-job abort:** Aborting `signal` resolves `push()` immediately with `ABORTED` (`status: 'released'`, `cause: signal.reason`) and removes waiting or buffered entries. If an attempt is in flight, its context signal aborts and settles without retry.
 - **Fair capacity:** Queues sharing bucket instances interleave fairly: each waiting queue dispatches one job per turn.
-- **Graceful shutdown:** `queue.stop(options?: StopOptions)` flushes waiting jobs (`status: 'released'`, `code: 'STOPPED'`), stops the limiter, and awaits active attempts (or aborts them if `abort: true`).
+- **Graceful shutdown:** `queue.stop(options?: StopOptions)` flushes waiting jobs (`status: 'released'`, `code: 'STOPPED'`), stops the limiter, and awaits active attempts (or aborts them if `abort: true`). The returned summary accounts for every pushed job of that run, including waiting jobs released or aborted before reaching the limiter.
+- **Run failure:** If a run fails (e.g. `BUCKET_FAILED` or `CLOCK_FAILED`), every unfinished `push()` of that run resolves with `status: 'released'` and that error, whether the job was waiting, buffered, or in flight. The next `push()` starts a new run; jobs pushed while a failed run is still awaiting active attempts run in that new run.
 - **Queue status:** `queue.getStatus()` returns standard `LimiterStatus` augmented with `waiting` count.
 
 ## Error Codes Reference
@@ -378,6 +382,7 @@ All errors returned by the limiter, `runAll`, and `createQueue` contain stable e
 | `INVALID_COST` | Job cost is not an object of non-negative numbers | Fails that individual job |
 | `COST_EXCEEDS_LIMIT` | Job cost exceeds total bucket capacity | Fails that individual job immediately |
 | `BUCKET_FAILED` | Bucket threw or returned an invalid wait value | Halts run or logs error on settle/unsubscribe |
+| `CLOCK_FAILED` | Custom `clock` threw or returned an invalid time | Halts run |
 | `PROCESS_JOB_THREW` | `processJob()` threw instead of returning result | Attempt `JobError.code` (`fatal`, settles as `FATAL`) |
 | `INVALID_RESULT` | `processJob()` returned malformed result object | Attempt `JobError.code` (`fatal`, settles as `FATAL`) |
 | `TIMEOUT` | Attempt duration exceeded `timeoutMs` | Attempt `JobError.code` (`retry_backoff`) |

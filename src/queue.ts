@@ -39,6 +39,9 @@ type Entry<J, D> = {
     onAbort: (() => void) | undefined;
 };
 
+/** Per-run counter of waiting jobs released or aborted before being fetched by the limiter. */
+type ReleaseCounter = { count: number };
+
 // -------------------------------------------------------------------
 // --- 2. Constants
 // -------------------------------------------------------------------
@@ -55,17 +58,25 @@ const UNLIMITED_BUFFER = Number.POSITIVE_INFINITY;
  *
  * - `push` enqueues jobs by `priority` (higher first), then push order; resolves with outcome
  * - runs automatically when jobs are available; stops when empty
- * - releases pending jobs on stop or abort
+ * - releases pending jobs on stop or abort; `stop` summary counts them as released
+ * - failed run: every unfinished job resolves released with run error
  * - `maxBufferSize` defaults to `Infinity`: jobs wait in memory, so no source to protect from draining
  * - never throws; `push` never rejects
  */
 export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
     const waiting: Entry<J, D>[] = [];
+    // Error of failed current run; replaces STOPPED of jobs limiter releases for that failure.
+    let runError: LimiterError | undefined;
+    // Counter of current run; replaced per run so pending stop() keeps count of its run.
+    let releasedWaiting: ReleaseCounter = { count: 0 };
     let limiter: Limiter;
     try {
         limiter = createLimiterWith(wrapOptions(options), {
             isSourceDone: () => waiting.length === 0,
-            onStop: releaseWaiting,
+            onStop: (reason, error) => {
+                runError = error;
+                releaseWaiting(reason, error);
+            },
             unwrapJob: (entry) => entry.job,
         });
     } catch (error) {
@@ -99,7 +110,10 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
                               : context,
                       )
                 : processJob) as LimiterOptions<Entry<J, D>, D>['processJob'],
-            onJobDone: (entry, outcome) => settle(entry, outcome),
+            onJobDone: (entry, outcome) => {
+                const isStopped = outcome.status === 'released' && outcome.error.code === 'STOPPED';
+                settle(entry, isStopped && runError ? { ok: false, status: 'released', error: runError } : outcome);
+            },
         };
         if (onAttempt !== undefined) {
             // Retain non-function onAttempt to trigger INVALID_CONFIG in limiter.
@@ -112,6 +126,7 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
         return wrapped;
     }
 
+    /** Enqueues job by priority, returning promise resolved with final outcome. */
     function push(job: J, pushOptions?: PushOptions): Promise<JobOutcome<D>> {
         return new Promise((resolve) => {
             let cost: Cost | undefined;
@@ -161,18 +176,20 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
 
     /** Starts run; restarts if jobs were queued while stopping. */
     function startRun(): void {
+        releasedWaiting = { count: 0 };
         void limiter.start().then((result) => {
             // Push may have already started next run.
             if (waiting.length === 0 || !limiter.isIdle()) {
                 return;
             }
-            if (!result.ok) {
-                // Run failed; reject remaining waiting jobs.
+            if (!result.ok && result.error.code === 'INVALID_CONFIG') {
+                // Invalid options fail every run: release waiting jobs instead of restarting forever.
                 for (const entry of waiting.splice(0)) {
                     settle(entry, { ok: false, status: 'released', error: result.error });
                 }
                 return;
             }
+            // Jobs left here were pushed while the run was stopping, including after a run failure.
             startRun();
         });
     }
@@ -181,6 +198,7 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
     function releaseWaiting(reason: StopReason, error: LimiterError | undefined): void {
         const releaseError =
             error ?? createLimiterError(reason === 'max_wait_exceeded' ? 'MAX_WAIT_EXCEEDED' : 'STOPPED');
+        releasedWaiting.count += waiting.length;
         for (const entry of waiting.splice(0)) {
             settle(entry, { ok: false, status: 'released', error: releaseError });
         }
@@ -196,6 +214,7 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
         const index = waiting.indexOf(entry);
         if (index !== -1) {
             waiting.splice(index, 1);
+            releasedWaiting.count++;
             // Re-checks the source so a run waiting on a bucket or lock timer ends at once when nothing is left.
             if (!limiter.isIdle()) {
                 limiter.wake();
@@ -217,14 +236,27 @@ export function createQueue<J, D>(options: QueueOptions<J, D>): Queue<J, D> {
         entry.resolve(outcome);
     }
 
+    /** Returns status snapshot augmented with waiting count. */
     function getStatus(): QueueStatus {
         return { ...limiter.getStatus(), waiting: waiting.length };
     }
 
+    /** Releases waiting jobs and stops underlying limiter. */
     function stop(stopOptions?: StopOptions): Promise<Result<RunSummary, LimiterError>> {
+        if (limiter.isIdle()) {
+            // No run to report: count only what this call releases.
+            releasedWaiting = { count: 0 };
+        }
+        const counter = releasedWaiting;
         // Release waiting jobs even if run is already stopping so none triggers a new run.
         releaseWaiting('stop', undefined);
-        return limiter.stop(stopOptions);
+        return limiter
+            .stop(stopOptions)
+            .then((result) =>
+                result.ok
+                    ? { ok: true, data: { ...result.data, released: result.data.released + counter.count } }
+                    : result,
+            );
     }
 
     return { push, stop, getStatus };

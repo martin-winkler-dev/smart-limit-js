@@ -18,14 +18,31 @@ import { callSafely, isFiniteNonNegative, isObject } from './util.js';
 // --- 1. Types
 // -------------------------------------------------------------------
 
-/** Active booking in sliding window; tracks expiration and settle state. */
-type Reservation = { at: number; amount: number; inWindow: boolean; isInFlight: boolean };
+/** Settled usage in sliding window. */
+type Booking = { at: number; amount: number };
+
+/** Handle of unsettled attempt; counts toward window until settled. */
+type Reservation = { amount: number; isOpen: boolean };
+
+/** Change subscribers of a bucket. */
+type Listeners = { subscribe: (onChange: () => void) => () => void; notify: () => void; rotate: () => void };
 
 /** Normalized configuration for sliding window bucket. */
 type SlidingWindowConfig = { unit: string; limit: number; windowMs: number; used: PriorUsage };
 
-/** Longest wait across buckets and whether any bucket awaits change notification. */
-export type BucketWait = { waitMs: number; waitForChange: boolean };
+/** Computes delay after which a `WAIT_FOR_CHANGE` answer changes without notification. */
+type RecheckHint = (cost: Cost, now: number) => number;
+
+/**
+ * **Wait across buckets.**
+ *
+ * - `waitMs`: longest timed wait
+ * - `waitForChange`: some bucket awaits change notification
+ * - `recheckMs`: delay until next timed re-check; equals `waitMs` unless waiting for change, then delay until all
+ *   `WAIT_FOR_CHANGE` buckets can change without notification (`Infinity` if any requires notification); not counted
+ *   toward `maxWaitMs`
+ */
+export type BucketWait = { waitMs: number; waitForChange: boolean; recheckMs: number };
 
 /** Result of reserving capacity across all buckets. */
 export type BucketReservationResult = { reserved: true; reservations: unknown[] } | ({ reserved: false } & BucketWait);
@@ -37,6 +54,16 @@ export type BucketReservationResult = { reserved: true; reservations: unknown[] 
 /** Signal for `getWaitMs` indicating block until bucket `subscribe` reports change. */
 export const WAIT_FOR_CHANGE = -1;
 
+const HOOK_NAMES = ['getWaitMs', 'reserve', 'settle', 'subscribe'] as const;
+
+/**
+ * **Re-check hints of built-in buckets**: read by `checkBuckets` after a `WAIT_FOR_CHANGE` answer.
+ *
+ * - sliding window: settled bookings expire without notification while in-flight ones still block
+ * - buckets without hint change only with notification
+ */
+const recheckHints = new WeakMap<Bucket, RecheckHint>();
+
 const MS_PER_MINUTE = 60_000;
 const MS_PER_DAY = 86_400_000;
 
@@ -44,8 +71,18 @@ const MS_PER_DAY = 86_400_000;
 // --- 3. Exported Functions
 // -------------------------------------------------------------------
 
-/** Creates bucket from hook definitions. */
+/**
+ * **Creates bucket from hook definitions**: missing hooks default to "fits" and "nothing to do".
+ *
+ * - non-object `hooks` or non-function hook properties return a bucket with `configError` instead of throwing
+ */
 export function createBucket<R = undefined>(hooks: BucketHooks<R> = {}): Bucket {
+    // Reading hooks can throw (getter, revoked Proxy).
+    const problem = callSafely(() => findHookProblem(hooks));
+    if (!problem.ok || problem.data !== undefined) {
+        const cause = problem.ok ? problem.data : problem.error;
+        return { ...createBucket(), configError: createLimiterError('INVALID_CONFIG', cause) };
+    }
     const bucket: Bucket = {
         getWaitMs(cost, now) {
             return hooks.getWaitMs ? hooks.getWaitMs(cost, now) : 0;
@@ -68,7 +105,7 @@ export function createBucket<R = undefined>(hooks: BucketHooks<R> = {}): Bucket 
  * **Limits concurrent attempts across limiters**: announces freed slots via round-robin notifications.
  *
  * - caps in-flight attempts at `limit`
- * - notifies subscribers in round-robin order when slot frees
+ * - notifies subscribers when slot frees; next subscriber goes first after each reservation
  * - not strictly FIFO: under continuous contention later limiters may claim freed slot
  */
 export function createConcurrencyBucket(limit: number): Bucket {
@@ -79,8 +116,7 @@ export function createConcurrencyBucket(limit: number): Bucket {
         };
     }
     let inFlight = 0;
-    let firstListener = 0;
-    const listeners: (() => void)[] = [];
+    const listeners = createListeners();
 
     return createBucket<{ isOpen: boolean }>({
         getWaitMs() {
@@ -88,6 +124,7 @@ export function createConcurrencyBucket(limit: number): Bucket {
         },
         reserve() {
             inFlight++;
+            listeners.rotate();
             return { isOpen: true };
         },
         settle(reservation) {
@@ -96,138 +133,146 @@ export function createConcurrencyBucket(limit: number): Bucket {
             }
             reservation.isOpen = false;
             inFlight--;
-            // Snapshot listeners to support mid-notification unsubscribes.
-            const current = [...listeners];
-            firstListener = current.length > 0 ? (firstListener + 1) % current.length : 0;
-            for (let i = 0; i < current.length; i++) {
-                callSafely(current[(firstListener + i) % current.length]);
-            }
+            listeners.notify();
         },
-        subscribe: (onChange) => addListener(listeners, onChange),
+        subscribe: listeners.subscribe,
     });
 }
 
 /**
  * **Sliding window rate limiter bucket**: bounds usage to `limit` units within rolling `perMs` duration.
  *
- * - tracks timestamped reservations within rolling window
- * - notifies subscribers on every settle (estimate may shrink or booking moves)
+ * - tracks timestamped settled usage within rolling window
+ * - unsettled attempts count until settle, even when older than window; usage is booked at settle time
+ * - notifies subscribers on every settle (estimate may shrink or booking moves); next subscriber goes first
+ *   after each reservation
  * - wait counts in-flight bookings as freeable on settle: shortfall covered by them gives `WAIT_FOR_CHANGE`, else
  *   wait for settled bookings to cover rest (lower bound; avoids false `maxWaitMs` stops)
+ * - `WAIT_FOR_CHANGE` comes with re-check hint for limiter: delay until expiring settled bookings make room
+ *   while in-flight ones stay
  * - invalid options return bucket with `configError` instead of throwing
  * - supports bursts up to limit or steady pacing based on window size
  */
 export function createSlidingWindow(options: SlidingWindowOptions): Bucket {
-    const config = validateSlidingWindowOptions(options);
+    // Reading options can throw (getter, revoked Proxy).
+    const read = callSafely(() => validateSlidingWindowOptions(options));
+    const config = read.ok ? read.data : read;
     if (!config.ok) {
         return { ...createBucket(), configError: createLimiterError('INVALID_CONFIG', config.error) };
     }
     const { unit, limit, windowMs, used } = config.data;
-    const reservations: Reservation[] =
+    // Ignores float residue of fractional amounts added to and removed from the totals.
+    const tolerance = limit * 1e-9;
+    // Settled usage in time order.
+    const bookings: Booking[] =
         typeof used === 'number'
             ? []
-            : used
-                  .map((entry) => ({ at: entry.at, amount: entry.amount ?? 1, inWindow: true, isInFlight: false }))
-                  .sort((a, b) => a.at - b.at);
-    let totalInWindow = reservations.reduce((sum, reservation) => sum + reservation.amount, 0);
-    // Portion of totalInWindow booked by unsettled attempts.
-    let inFlightInWindow = 0;
-    const listeners: (() => void)[] = [];
+            : used.map((entry) => ({ at: entry.at, amount: entry.amount ?? 1 })).sort((a, b) => a.at - b.at);
+    let settledInWindow = bookings.reduce((sum, booking) => sum + booking.amount, 0);
+    // Unsettled attempts; never age out, so their settle always wakes waiting limiters.
+    let inFlight = 0;
+    let inFlightCount = 0;
+    const listeners = createListeners();
     // Numeric prior usage booked on first call timestamp.
     let unbookedPriorUsage = typeof used === 'number' ? used : 0;
     let isFirstCall = true;
-    // Index of oldest valid reservation; pruned in batches.
+    // Index of oldest valid booking; pruned in batches.
     let head = 0;
 
-    /** Advances window time, prunes expired entries, and books initial prior usage. */
+    /** Advances window time, prunes expired bookings, and books initial prior usage. */
     function moveWindowTo(now: number): number {
         if (isFirstCall) {
             isFirstCall = false;
-            for (const reservation of reservations) {
-                reservation.at = Math.min(reservation.at, now);
+            for (const booking of bookings) {
+                booking.at = Math.min(booking.at, now);
             }
             if (unbookedPriorUsage > 0) {
-                reservations.push({ at: now, amount: unbookedPriorUsage, inWindow: true, isInFlight: false });
-                totalInWindow += unbookedPriorUsage;
+                bookings.push({ at: now, amount: unbookedPriorUsage });
+                settledInWindow += unbookedPriorUsage;
                 unbookedPriorUsage = 0;
             }
         }
-        const time = Math.max(now, reservations.at(-1)?.at ?? Number.NEGATIVE_INFINITY);
-        while (head < reservations.length && reservations[head].at + windowMs <= time) {
-            totalInWindow -= reservations[head].amount;
-            if (reservations[head].isInFlight) {
-                inFlightInWindow -= reservations[head].amount;
-            }
-            reservations[head].inWindow = false;
+        const time = Math.max(now, bookings.at(-1)?.at ?? Number.NEGATIVE_INFINITY);
+        while (head < bookings.length && bookings[head].at + windowMs <= time) {
+            settledInWindow -= bookings[head].amount;
             head++;
         }
-        if (head >= 1024 && head * 2 >= reservations.length) {
-            reservations.splice(0, head);
+        if (head === bookings.length) {
+            // Drops float residue of fractional amounts.
+            settledInWindow = 0;
+        }
+        if (head >= 1024 && head * 2 >= bookings.length) {
+            bookings.splice(0, head);
             head = 0;
         }
         return time;
     }
 
-    return createBucket<Reservation>({
+    /** Walks oldest settled bookings until `excess` has left the window; returns wait until then. */
+    function getExpiryWaitMs(excess: number, time: number): number {
+        let rest = excess;
+        let waitMs = 0;
+        for (let i = head; i < bookings.length && rest > tolerance; i++) {
+            rest -= bookings[i].amount;
+            waitMs = bookings[i].at + windowMs - time;
+        }
+        return Math.max(waitMs, 0);
+    }
+
+    const bucket = createBucket<Reservation>({
         getWaitMs(cost, now) {
             const amount = cost[unit] ?? 0;
             if (amount > limit) {
                 return Number.POSITIVE_INFINITY;
             }
             const time = moveWindowTo(now);
-            let excess = totalInWindow + amount - limit;
-            // Ignores float residue of fractional amounts added to and removed from totalInWindow.
-            const tolerance = limit * 1e-9;
+            const excess = settledInWindow + inFlight + amount - limit;
             if (excess <= tolerance) {
                 return 0;
             }
             // In-flight bookings may settle and free capacity at any time.
-            excess -= inFlightInWindow;
-            if (excess <= tolerance) {
+            if (excess - inFlight <= tolerance) {
                 return WAIT_FOR_CHANGE;
             }
-            // Walk oldest settled reservations until enough leave the window to make room.
-            let waitMs = 0;
-            for (let i = head; i < reservations.length && excess > tolerance; i++) {
-                if (!reservations[i].isInFlight) {
-                    excess -= reservations[i].amount;
-                    waitMs = reservations[i].at + windowMs - time;
-                }
-            }
-            return Math.max(waitMs, 0);
+            return getExpiryWaitMs(excess - inFlight, time);
         },
         reserve(cost, now) {
-            const reservation = { at: moveWindowTo(now), amount: cost[unit] ?? 0, inWindow: true, isInFlight: true };
-            reservations.push(reservation);
-            totalInWindow += reservation.amount;
-            inFlightInWindow += reservation.amount;
+            moveWindowTo(now);
+            const reservation = { amount: cost[unit] ?? 0, isOpen: true };
+            inFlight += reservation.amount;
+            inFlightCount++;
+            listeners.rotate();
             return reservation;
         },
         settle(reservation, actualCost, now) {
-            const amount = actualCost[unit] ?? 0;
-            // Advance window first so expired entries are dropped before recalculating.
+            if (!reservation?.isOpen) {
+                return;
+            }
+            reservation.isOpen = false;
+            inFlightCount--;
+            // Reset on last settle drops float residue of fractional amounts.
+            inFlight = inFlightCount === 0 ? 0 : inFlight - reservation.amount;
+            // Books actual usage at settle timestamp; keeps list in time order.
             const time = moveWindowTo(now);
-            // Moves entry to settle timestamp with actual usage; keeps list chronologically sorted.
-            if (reservation.inWindow) {
-                totalInWindow -= reservation.amount;
-                if (reservation.isInFlight) {
-                    inFlightInWindow -= reservation.amount;
-                }
-                reservations.splice(reservations.indexOf(reservation, head), 1);
+            const amount = actualCost[unit] ?? 0;
+            if (amount > 0) {
+                bookings.push({ at: time, amount });
+                settledInWindow += amount;
             }
-            reservation.at = time;
-            reservation.amount = amount;
-            reservation.inWindow = true;
-            reservation.isInFlight = false;
-            reservations.push(reservation);
-            totalInWindow += amount;
-            // Snapshot listeners to support mid-notification unsubscribes.
-            for (const listener of [...listeners]) {
-                callSafely(listener);
-            }
+            listeners.notify();
         },
-        subscribe: (onChange) => addListener(listeners, onChange),
+        subscribe: listeners.subscribe,
     });
+    // Settled bookings expire without notification: returns delay until they make room alongside in-flight bookings.
+    recheckHints.set(bucket, (cost, now) => {
+        const amount = cost[unit] ?? 0;
+        if (inFlight + amount - limit > tolerance) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const time = moveWindowTo(now);
+        return getExpiryWaitMs(settledInWindow + inFlight + amount - limit, time);
+    });
+    return bucket;
 }
 
 /** Creates requests-per-minute (RPM) sliding window bucket. */
@@ -260,6 +305,7 @@ export function createTPD(limit: number, options: SlidingWindowShortcutOptions =
 export function checkBuckets(buckets: readonly Bucket[], cost: Cost, now: number): Result<BucketWait, LimiterError> {
     let waitMs = 0;
     let waitForChange = false;
+    let changeRecheckMs = 0;
     for (const bucket of buckets) {
         const answer = callSafely(() => bucket.getWaitMs(cost, now));
         if (
@@ -278,11 +324,13 @@ export function checkBuckets(buckets: readonly Bucket[], cost: Cost, now: number
                 return { ok: false, error: createLimiterError('BUCKET_FAILED', 'WAIT_FOR_CHANGE without subscribe') };
             }
             waitForChange = true;
+            const hint = recheckHints.get(bucket);
+            changeRecheckMs = Math.max(changeRecheckMs, hint ? hint(cost, now) : Number.POSITIVE_INFINITY);
         } else {
             waitMs = Math.max(waitMs, answer.data);
         }
     }
-    return { ok: true, data: { waitMs, waitForChange } };
+    return { ok: true, data: { waitMs, waitForChange, recheckMs: Math.max(waitMs, changeRecheckMs) } };
 }
 
 /**
@@ -322,15 +370,53 @@ export function tryReserveBuckets(
 // --- 4. Private Functions
 // -------------------------------------------------------------------
 
-/** Adds change listener; returns unsubscribe function. */
-function addListener(listeners: (() => void)[], onChange: () => void): () => void {
-    listeners.push(onChange);
-    return () => {
-        const index = listeners.indexOf(onChange);
-        if (index !== -1) {
-            listeners.splice(index, 1);
-        }
+/**
+ * **Creates subscriber list with round-robin notification**: next subscriber goes first after each reservation.
+ *
+ * - limiters dispatch in notification order; fixed order lets first subscriber take all freed capacity
+ * - `rotate` (called on reserve): advances starting subscriber by one for subsequent notifications
+ * - preserves notification order when no reservation occurred in between, so first subscriber keeps its turn until capacity suffices
+ * - snapshot per notification supports unsubscribes while notifying
+ * - throwing subscriber does not stop the others
+ */
+function createListeners(): Listeners {
+    const listeners: (() => void)[] = [];
+    let first = 0;
+    let isRotationDue = false;
+    return {
+        subscribe(onChange) {
+            listeners.push(onChange);
+            return () => {
+                const index = listeners.indexOf(onChange);
+                if (index !== -1) {
+                    listeners.splice(index, 1);
+                }
+            };
+        },
+        notify() {
+            const current = [...listeners];
+            if (isRotationDue) {
+                isRotationDue = false;
+                first++;
+            }
+            first = current.length > 0 ? first % current.length : 0;
+            for (let i = 0; i < current.length; i++) {
+                callSafely(current[(first + i) % current.length]);
+            }
+        },
+        rotate() {
+            isRotationDue = true;
+        },
     };
+}
+
+/** Returns error message when `hooks` is not an object or has a non-function hook property. */
+function findHookProblem<R>(hooks: BucketHooks<R>): string | undefined {
+    if (!isObject(hooks)) {
+        return 'bucket hooks must be an object';
+    }
+    const invalid = HOOK_NAMES.find((name) => hooks[name] !== undefined && typeof hooks[name] !== 'function');
+    return invalid && `${invalid} must be a function`;
 }
 
 /** Validates sliding window configuration options. */

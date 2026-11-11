@@ -145,6 +145,43 @@ describe('runAll', () => {
         expect(!notArray.ok && notArray.error.code).toBe('INVALID_CONFIG');
     });
 
+    it.each([
+        ['a raw value', ['a', 'b']],
+        ['null', [{ job: 1 }, null]],
+        ['defined undefined element', [{ job: 1 }, undefined]],
+        ['an object without job', [{ job: 1 }, { cost: { tokens: 1 } }]],
+    ])('rejects %s as item with INVALID_CONFIG and runs no job at all', async (_name, items) => {
+        let calls = 0;
+        const result = await runAll(items as never, {
+            processJob: () => {
+                calls++;
+                return { ok: true, data: 1 };
+            },
+        });
+        const index = items.findIndex((item) => typeof item !== 'object' || item === null || !('job' in item));
+        expect(result).toMatchObject({
+            ok: false,
+            error: { code: 'INVALID_CONFIG', cause: `items[${index}] must be an object with a job property` },
+        });
+        expect('data' in result).toBe(false);
+        expect(calls).toBe(0);
+    });
+
+    it('accepts an item whose job is undefined, null or inherited', async () => {
+        const seen: unknown[] = [];
+        const result = await runAll<unknown, number>(
+            [{ job: undefined }, { job: null }, Object.create({ job: 'inherited' })],
+            {
+                processJob: (job) => {
+                    seen.push(job);
+                    return { ok: true, data: seen.length };
+                },
+            },
+        );
+        expect(result.ok && result.data.map((item) => item.status)).toEqual(['done', 'done', 'done']);
+        expect(seen).toEqual([undefined, null, 'inherited']);
+    });
+
     it('resolves with INVALID_CONFIG instead of rejecting when an item or the options throw while read', async () => {
         function processJob() {
             return { ok: true as const, data: 1 };

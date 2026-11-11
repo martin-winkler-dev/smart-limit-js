@@ -25,10 +25,8 @@ export type QueuedJob<J> = {
     isHookPending: boolean;
     /** Retry expiration timestamp; 0 for immediate retry. */
     retryAt: number;
-    /** First failure timestamp for cumulative maxWaitMs. */
-    firstFailedAt: number | undefined;
-    /** Cumulative lock duration at time of first failure. */
-    lockedMsAtFirstFailure: number;
+    /** Sum of retry_backoff delays so far, checked against maxWaitMs. */
+    backoffWaitedMs: number;
 };
 
 /** Global backoff lock phase: unlocked, waiting, or retrying. */
@@ -63,10 +61,6 @@ export type RunState<J> = {
     queue: QueuedJob<J>[];
     /** In-flight attempts and unsettled hooks awaiting completion. */
     pending: number;
-    /** Cumulative duration spent in resolved global locks. */
-    lockedMs: number;
-    /** Start timestamp of active lock, or undefined if unlocked. */
-    lockStartedAt: number | undefined;
     /** True while fetchJob is actively running. */
     isFetching: boolean;
     /** True when fetchJob returned empty without subsequent wake. */
@@ -99,6 +93,8 @@ export type RunState<J> = {
     released: number;
     /** Fatal error terminating the run. */
     error: LimiterError | undefined;
+    /** True once clock failure was reported for this run. */
+    isClockFailed: boolean;
     /** Run promise resolution handler. */
     resolve: (result: Result<RunSummary, LimiterError>) => void;
     /** Pending stop promise resolution handlers. */
@@ -114,8 +110,6 @@ export function createRunState<J>(resolve: RunState<J>['resolve']): RunState<J> 
     return {
         queue: [],
         pending: 0,
-        lockedMs: 0,
-        lockStartedAt: undefined,
         isFetching: false,
         isSourceEmpty: false,
         wakeCount: 0,
@@ -132,6 +126,7 @@ export function createRunState<J>(resolve: RunState<J>['resolve']): RunState<J> 
         failed: 0,
         released: 0,
         error: undefined,
+        isClockFailed: false,
         resolve,
         stopResolvers: [],
     };

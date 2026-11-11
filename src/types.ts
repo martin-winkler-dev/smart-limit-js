@@ -24,7 +24,7 @@ export type LimiterError = { code: LimiterErrorCode; message: string; cause?: un
 
 /** Passive rate limit interface for capacity checks and reservations. */
 export type Bucket = {
-    /** Set when bucket was created with invalid options. */
+    /** Configuration error when bucket options were invalid. */
     readonly configError?: LimiterError;
     /** Milliseconds until cost fits (0 = now, Infinity = never, WAIT_FOR_CHANGE = until event). */
     getWaitMs(cost: Cost, now: number): number;
@@ -143,7 +143,7 @@ export type LimiterStatus = {
     state: LimiterState;
     /** ProcessJob attempts currently in flight. */
     running: number;
-    /** Jobs waiting in internal retry buffer. */
+    /** Jobs waiting in internal buffer (to run or retry). */
     buffered: number;
     /** Timestamp when global backoff lock expires; 0 when unlocked. */
     lockUntil: number;
@@ -161,7 +161,7 @@ export type LimiterOptions<J, D> = {
     buckets?: readonly Bucket[];
     /** Maximum concurrent jobs in flight; default 5. */
     concurrency?: number;
-    /** Maximum queued retry jobs before pausing fetchJob; defaults to concurrency (Infinity for createQueue). */
+    /** Maximum buffered jobs before pausing fetchJob; defaults to concurrency (Infinity for createQueue). */
     maxBufferSize?: number;
     /** Maximum retries per job for retryable errors; default 4. */
     maxRetries?: number;
@@ -252,9 +252,9 @@ export type QueueStatus = LimiterStatus & {
     waiting: number;
 };
 
-/** FIFO job queue wrapping rate limiter. */
+/** Priority job queue wrapping rate limiter. */
 export type Queue<J, D> = {
-    /** Enqueue job in FIFO order, starting run if idle; resolves with outcome and never rejects. */
+    /** Enqueue job by priority, starting run if idle; resolves with outcome and never rejects. */
     push(job: J, options?: PushOptions): Promise<JobOutcome<D>>;
     /** Release all waiting jobs and stop underlying limiter. */
     stop(options?: StopOptions): Promise<Result<RunSummary, LimiterError>>;

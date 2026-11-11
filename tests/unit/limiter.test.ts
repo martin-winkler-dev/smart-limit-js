@@ -1766,7 +1766,97 @@ describe('implementation plan invariants and edge cases', () => {
         expect(clock.now()).toBe(5_000);
     });
 
-    it('per-item retry_backoff fails with MAX_WAIT_EXCEEDED once the cumulative wait since its first failure exceeds maxWaitMs', async () => {
+    it('does not count the duration of attempts toward the retry_backoff budget of a job', async () => {
+        const { clock, limiter, started, done } = setup({
+            jobs: 1,
+            maxRetries: 10,
+            maxWaitMs: 10_000,
+            processJob: async (job) => {
+                started.push([job.id, clock.now()]);
+                await sleep(clock, 4_000);
+                return started.length < 6
+                    ? { ok: false, error: { type: 'retry_backoff', message: 'slow item', retryAfterMs: 100 } }
+                    : { ok: true, data: `result ${job.id}` };
+            },
+        });
+        await clock.settle(limiter.start());
+        // 20 s of attempts, 500 ms of backoff.
+        expect(started.map(([, at]) => at)).toEqual([0, 4_100, 8_200, 12_300, 16_400, 20_500]);
+        expect(done).toEqual([[1, 'result 1']]);
+    });
+
+    it('does not count waiting for a concurrency slot toward the retry_backoff budget of a job', async () => {
+        const { clock, limiter, started, done } = setup({
+            jobs: 2,
+            concurrency: 1,
+            // Lets job 2 be fetched while job 1 waits for its retry.
+            maxBufferSize: 2,
+            maxRetries: 10,
+            maxWaitMs: 5_000,
+            processJob: async (job) => {
+                started.push([job.id, clock.now()]);
+                if (job.id === 2) {
+                    await sleep(clock, 20_000);
+                    return { ok: true, data: 'result 2' };
+                }
+                return started.filter(([id]) => id === 1).length <= 2
+                    ? { ok: false, error: { type: 'retry_backoff', message: 'busy', retryAfterMs: 100 } }
+                    : { ok: true, data: 'result 1' };
+            },
+        });
+        await clock.settle(limiter.start());
+        // Job 1 is ready at 100 but job 2 holds the only slot until 20,000.
+        expect(started).toEqual([
+            [1, 0],
+            [2, 0],
+            [1, 20_000],
+            [1, 20_100],
+        ]);
+        expect(done).toEqual([
+            [2, 'result 2'],
+            [1, 'result 1'],
+        ]);
+    });
+
+    it('does not count waiting for bucket capacity toward the retry_backoff budget of a job', async () => {
+        const { clock, limiter, started, done } = setup({
+            jobs: 1,
+            maxRetries: 10,
+            maxWaitMs: 60_000,
+            buckets: [createRPM(1)],
+            processJob: (job) => {
+                started.push([job.id, clock.now()]);
+                return started.length <= 2
+                    ? { ok: false, error: { type: 'retry_backoff', message: 'busy', retryAfterMs: 100 } }
+                    : { ok: true, data: `result ${job.id}` };
+            },
+        });
+        await clock.settle(limiter.start());
+        expect(started.map(([, at]) => at)).toEqual([0, 60_000, 120_000]);
+        expect(done).toEqual([[1, 'result 1']]);
+    });
+
+    it.each([
+        [3_000, 'result 1'],
+        [2_999, 'MAX_WAIT_EXCEEDED'],
+    ])('retry_backoff delays of 3 x 1,000 ms with maxWaitMs %p end in %p', async (maxWaitMs, expected) => {
+        const { clock, limiter, started, done } = setup({
+            jobs: 1,
+            maxRetries: 10,
+            maxWaitMs,
+            processJob: (job) => {
+                started.push([job.id, clock.now()]);
+                return started.length <= 3
+                    ? { ok: false, error: { type: 'retry_backoff', message: 'slow item', retryAfterMs: 1_000 } }
+                    : { ok: true, data: `result ${job.id}` };
+            },
+        });
+        await clock.settle(limiter.start());
+        expect(done).toEqual([[1, expected]]);
+        expect(started).toHaveLength(expected === 'result 1' ? 4 : 3);
+    });
+
+    it('per-item retry_backoff fails with MAX_WAIT_EXCEEDED once the sum of its backoff delays exceeds maxWaitMs', async () => {
         const { clock, limiter, started, done } = setup({
             jobs: 1,
             maxRetries: 10,
@@ -1777,7 +1867,7 @@ describe('implementation plan invariants and edge cases', () => {
             },
         });
         const result = await clock.settle(limiter.start());
-        // First failure at t=0: cumulative wait at t=2000 reaches 3000ms, exceeding maxWaitMs (2500ms).
+        // Third failure at t=2000: 2000ms of delays + 1000ms requested exceeds maxWaitMs (2500ms).
         expect(started).toEqual([
             [1, 0],
             [1, 1_000],
@@ -1823,7 +1913,7 @@ describe('implementation plan invariants and edge cases', () => {
         expect(result).toEqual({ ok: true, data: { done: 2, failed: 0, released: 0, stoppedBy: 'empty' } });
     });
 
-    it('still counts the time outside a global lock toward the retry_backoff budget of a job', async () => {
+    it('counts every requested retry_backoff delay of a job, even when it overlaps a global lock', async () => {
         const calls = new Map<number, number>();
         const { clock, limiter, done } = setup({
             jobs: 2,
@@ -1844,7 +1934,7 @@ describe('implementation plan invariants and edge cases', () => {
             },
         });
         await clock.settle(limiter.start());
-        // Third failure at t=8000: 6s non-lock time + 5s requested exceeds 10s budget.
+        // Third failure at t=8000: 8s of delays + 5s requested exceeds 10s budget.
         expect(done).toEqual([
             [2, 'result 2'],
             [1, 'MAX_WAIT_EXCEEDED'],

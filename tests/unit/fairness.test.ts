@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'bun:test';
-import { type Bucket, createConcurrencyBucket, createQueue, createSlidingWindow, type Queue } from '../../src/index.js';
+import {
+    type Bucket,
+    createConcurrencyBucket,
+    createQueue,
+    createSlidingWindow,
+    createTPM,
+    type Queue,
+} from '../../src/index.js';
 import { createFakeClock, type FakeClock } from '../../src/testing.js';
 
 type Start = { queue: string; at: number; pushedAt: number };
@@ -82,6 +89,63 @@ async function expectEqualSplitOnWindow(names: string[]) {
     expect(split.a).toBeGreaterThanOrEqual(0.4);
     expect(split.a).toBeLessThanOrEqual(0.6);
 }
+
+/** Runs equal backlogs on a shared token window where every settle frees most of the estimate. */
+async function runOnTokenWindow(names: string[], cost: number, usage: number): Promise<string[]> {
+    const clock = createFakeClock();
+    const shared = createTPM(1000);
+    const starts: string[] = [];
+    const queues = names.map((name) =>
+        createQueue<number, number>({
+            clock,
+            concurrency: 4,
+            buckets: [shared],
+            processJob: async (job) => {
+                starts.push(name);
+                await sleep(clock, 200);
+                return { ok: true, data: job, usage: { tokens: usage } };
+            },
+        }),
+    );
+    const pushed = queues.flatMap((queue) =>
+        Array.from({ length: 30 }, () => queue.push(0, { cost: { tokens: cost } })),
+    );
+    await clock.settle(Promise.all(pushed));
+    // Only starts while every queue still had jobs left.
+    return starts.slice(0, Math.min(...names.map((name) => starts.lastIndexOf(name))) + 1);
+}
+
+/** Returns longest run of consecutive starts by one queue. */
+function longestStreak(starts: string[]): number {
+    let longest = 0;
+    let streak = 0;
+    for (const [index, name] of starts.entries()) {
+        streak = name === starts[index - 1] ? streak + 1 : 1;
+        longest = Math.max(longest, streak);
+    }
+    return longest;
+}
+
+describe('fairness of queues on a shared token window with usage below the estimate', () => {
+    it.each([
+        // Every settle frees less than one job needs.
+        [['a', 'b'], 250, 20],
+        [['a', 'b', 'c'], 250, 20],
+        // Two settles are needed per start: a rotation per settle would always favor the same queue.
+        [['a', 'b'], 250, 125],
+        // One settle frees room for a whole job.
+        [['a', 'b', 'c'], 250, 0],
+        [['c', 'b', 'a'], 100, 50],
+    ])('%p with cost %p and usage %p: capacity freed by settles is split evenly', async (names, cost, usage) => {
+        const starts = await runOnTokenWindow(names, cost, usage);
+        expect(starts.length).toBeGreaterThanOrEqual(names.length * 25);
+        for (const name of names) {
+            const count = starts.filter((start) => start === name).length;
+            expect(Math.abs(count - starts.length / names.length)).toBeLessThanOrEqual(3);
+        }
+        expect(longestStreak(starts)).toBeLessThanOrEqual(4);
+    });
+});
 
 describe('fairness of queues on shared buckets', () => {
     it('window-bound, equal load: both queues start jobs in every window and split evenly', async () => {

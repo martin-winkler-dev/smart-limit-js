@@ -1,6 +1,6 @@
 {
   "name": "smart-limit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Rate limiter and job runner for API calls: concurrency, requests/cost per window, retries, 429 pauses. Never throws.",
   "keywords": [
     "rate-limit",

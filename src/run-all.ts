@@ -32,8 +32,9 @@ type Entry<J> = { index: number; job: J };
  * **Processes fixed batch of jobs with rate limiting.**
  *
  * - preserves input order in resolved outcomes array
+ * - defined item that is not a `{ job }` object gives `INVALID_CONFIG` before any job runs (sparse array holes run as job `undefined`)
  * - marks unfinished items as released if stopped or failed
- * - invokes optional `onJobDone` hook once per item, also for released items never started
+ * - invokes optional `onJobDone` hook once per item, including released items that never started
  * - never rejects
  */
 export async function runAll<J, D>(
@@ -65,6 +66,14 @@ async function runAllUnguarded<J, D>(
     const limiterOptions = readOptions(options) as Partial<LimiterOptions<Entry<J>, D>>;
     if (signal !== undefined && !(signal instanceof AbortSignal)) {
         return { ok: false, error: createLimiterError('INVALID_CONFIG', 'signal must be an AbortSignal') };
+    }
+    // Sparse array holes stay allowed (run as job undefined); any defined item without job is rejected.
+    const invalidIndex = items.findIndex((item, index) => index in items && !(isObject(item) && 'job' in item));
+    if (invalidIndex !== -1) {
+        return {
+            ok: false,
+            error: createLimiterError('INVALID_CONFIG', `items[${invalidIndex}] must be an object with a job property`),
+        };
     }
     let nextIndex = 0;
     // Preserve original cost; Array.from visits sparse array holes as undefined.

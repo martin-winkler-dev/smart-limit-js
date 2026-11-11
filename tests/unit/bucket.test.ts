@@ -14,6 +14,7 @@ import {
     tryReserveBuckets,
     WAIT_FOR_CHANGE,
 } from '../../src/bucket.js';
+import { createLimiter } from '../../src/limiter.js';
 import type { Bucket, Cost } from '../../src/types.js';
 
 describe('createSlidingWindow', () => {
@@ -105,11 +106,10 @@ describe('createSlidingWindow', () => {
         expect(rpm.getWaitMs({ requests: 2 }, 110_000)).toBe(0);
     });
 
-    it('books the whole usage of an entry that already left the window at the settle time', () => {
+    it('books the whole usage of an attempt that ran longer than the window at the settle time', () => {
         for (const used of [10, 40, 90]) {
             const tpm = createSlidingWindow({ tokens: 100, perMs: 60_000 });
             const reservation = tpm.reserve({ tokens: 40 }, 0);
-            expect(tpm.getWaitMs({ tokens: 100 }, 60_000)).toBe(0);
             // Attempt duration exceeds window duration.
             tpm.settle(reservation, { tokens: used }, 70_000);
             expect(tpm.getWaitMs({ tokens: 100 - used }, 70_000)).toBe(0);
@@ -134,6 +134,19 @@ describe('createSlidingWindow', () => {
         expect(tpm.getWaitMs({ tokens: 21 }, 80_000)).toBe(60_000);
         expect(tpm.getWaitMs({ tokens: 20 }, 80_000)).toBe(0);
         expect(tpm.getWaitMs({ tokens: 100 }, 140_000)).toBe(0);
+    });
+
+    it('books a reservation only once when it is settled twice', () => {
+        const tpm = createSlidingWindow({ tokens: 100, perMs: 60_000 });
+        const reservation = tpm.reserve({ tokens: 40 }, 0);
+        const other = tpm.reserve({ tokens: 40 }, 0);
+        tpm.settle(reservation, { tokens: 40 }, 0);
+        tpm.settle(reservation, { tokens: 40 }, 0);
+        // 40 settled + 40 in flight: a second booking or a second release would change either answer.
+        expect(tpm.getWaitMs({ tokens: 20 }, 0)).toBe(0);
+        expect(tpm.getWaitMs({ tokens: 21 }, 0)).toBe(WAIT_FOR_CHANGE);
+        tpm.settle(other, { tokens: 40 }, 0);
+        expect(tpm.getWaitMs({ tokens: 21 }, 0)).toBe(60_000);
     });
 
     it('paces with a small window', () => {
@@ -185,10 +198,11 @@ describe('createSlidingWindow notifies subscribers on settle (Gemini4 20.1)', ()
         tpm.subscribe?.(() => calls.push('a'));
         const unsubscribe = tpm.subscribe?.(() => calls.push('b'));
         tpm.settle(tpm.reserve({ tokens: 100 }, 0), { tokens: 10 }, 1_000);
-        expect(calls).toEqual(['a', 'b']);
+        expect(calls.toSorted()).toEqual(['a', 'b']);
         unsubscribe?.();
+        calls.length = 0;
         tpm.settle(tpm.reserve({ tokens: 10 }, 1_000), { tokens: 10 }, 2_000);
-        expect(calls).toEqual(['a', 'b', 'a']);
+        expect(calls).toEqual(['a']);
     });
 
     it('keeps notifying the others when one subscriber throws', () => {
@@ -227,11 +241,83 @@ describe('createSlidingWindow counts unsettled bookings as freeable (Gemini4 20.
         expect(tpm.getWaitMs({ tokens: 70 }, 30_000)).toBe(30_000);
     });
 
-    it('stops counting an in-flight booking once it left the window', () => {
+    it('keeps counting an in-flight booking that is older than the window, until it settles', () => {
         const tpm = createTPM(100);
-        tpm.reserve({ tokens: 100 }, 0);
-        book(tpm, { tokens: 100 }, 60_000);
-        expect(tpm.getWaitMs({ tokens: 1 }, 60_000)).toBe(60_000);
+        const reservation = tpm.reserve({ tokens: 60 }, 0);
+        // No settled booking can expire here, so the answer must not change by time alone.
+        for (const now of [59_999, 60_000, 600_000]) {
+            expect(tpm.getWaitMs({ tokens: 40 }, now)).toBe(0);
+            expect(tpm.getWaitMs({ tokens: 41 }, now)).toBe(WAIT_FOR_CHANGE);
+        }
+        tpm.settle(reservation, { tokens: 60 }, 600_000);
+        expect(tpm.getWaitMs({ tokens: 41 }, 600_000)).toBe(60_000);
+    });
+
+    it('still expires settled bookings while an older booking is in flight', () => {
+        const tpm = createTPM(100);
+        tpm.reserve({ tokens: 30 }, 0);
+        book(tpm, { tokens: 70 }, 10_000);
+        expect(tpm.getWaitMs({ tokens: 70 }, 20_000)).toBe(50_000);
+        expect(tpm.getWaitMs({ tokens: 70 }, 70_000)).toBe(0);
+    });
+});
+
+describe('notification order of shared buckets', () => {
+    const factories: [string, () => Bucket][] = [
+        ['createSlidingWindow', () => createSlidingWindow({ tokens: 100, perMs: 60_000 })],
+        ['createConcurrencyBucket', () => createConcurrencyBucket(10)],
+    ];
+
+    /** Settles one reservation and returns order of notified subscribers. */
+    function settleAndRecord(bucket: Bucket, calls: string[], reservation: unknown): string[] {
+        calls.length = 0;
+        bucket.settle(reservation, {}, 0);
+        return [...calls];
+    }
+
+    it.each(factories)('%s: a different subscriber goes first after each reservation', (_name, create) => {
+        const bucket = create();
+        const calls: string[] = [];
+        for (const name of ['a', 'b', 'c']) {
+            bucket.subscribe?.(() => calls.push(name));
+        }
+        const orders = [1, 2, 3, 4].map(() => settleAndRecord(bucket, calls, bucket.reserve({ tokens: 10 }, 0)));
+        expect(orders).toEqual([
+            ['b', 'c', 'a'],
+            ['c', 'a', 'b'],
+            ['a', 'b', 'c'],
+            ['b', 'c', 'a'],
+        ]);
+    });
+
+    it.each(factories)('%s: the first subscriber keeps its turn until a reservation is made', (_name, create) => {
+        const bucket = create();
+        const calls: string[] = [];
+        for (const name of ['a', 'b']) {
+            bucket.subscribe?.(() => calls.push(name));
+        }
+        const reservations = [1, 2, 3].map(() => bucket.reserve({ tokens: 10 }, 0));
+        // Settles that free too little for any subscriber must not hand the turn to the next one.
+        const orders = reservations.map((reservation) => settleAndRecord(bucket, calls, reservation));
+        expect(orders).toEqual([
+            ['b', 'a'],
+            ['b', 'a'],
+            ['b', 'a'],
+        ]);
+        expect(settleAndRecord(bucket, calls, bucket.reserve({ tokens: 10 }, 0))).toEqual(['a', 'b']);
+    });
+
+    it.each(factories)('%s: unsubscribing while notified does not skip the other subscribers', (_name, create) => {
+        const bucket = create();
+        const calls: string[] = [];
+        const unsubscribeA = bucket.subscribe?.(() => {
+            calls.push('a');
+            unsubscribeA?.();
+        });
+        bucket.subscribe?.(() => calls.push('b'));
+        bucket.subscribe?.(() => calls.push('c'));
+        expect(settleAndRecord(bucket, calls, bucket.reserve({ tokens: 10 }, 0)).toSorted()).toEqual(['a', 'b', 'c']);
+        expect(settleAndRecord(bucket, calls, bucket.reserve({ tokens: 10 }, 0)).toSorted()).toEqual(['b', 'c']);
     });
 });
 
@@ -241,6 +327,55 @@ describe('createBucket', () => {
         expect(bucket.getWaitMs({ requests: 1 }, 0)).toBe(0);
         expect(bucket.reserve({ requests: 1 }, 0)).toBeUndefined();
         expect(() => bucket.settle(undefined, {}, 0)).not.toThrow();
+    });
+
+    it.each([
+        ['null', null, 'bucket hooks must be an object'],
+        ['a number', 5, 'bucket hooks must be an object'],
+        ['a function', () => 0, 'bucket hooks must be an object'],
+        ['non-function getWaitMs', { getWaitMs: 1_000 }, 'getWaitMs must be a function'],
+        ['non-function subscribe', { getWaitMs: () => 0, subscribe: true }, 'subscribe must be a function'],
+    ])('carries a configError instead of throwing for %s', (_name, hooks, cause) => {
+        const bucket = createBucket(hooks as never);
+        expect(bucket.configError).toMatchObject({ code: 'INVALID_CONFIG', cause });
+        // Still a complete bucket, like the other factories return for invalid options.
+        expect(bucket.getWaitMs({ requests: 1 }, 0)).toBe(0);
+        expect(() => bucket.settle(bucket.reserve({ requests: 1 }, 0), {}, 0)).not.toThrow();
+    });
+
+    it.each([
+        ['createBucket', createBucket as (options: never) => Bucket],
+        ['createSlidingWindow', createSlidingWindow as (options: never) => Bucket],
+    ])('%s carries a configError instead of throwing when reading its argument throws', (_name, create) => {
+        const withGetter = {
+            get getWaitMs(): never {
+                throw new Error('getter broke');
+            },
+            get perMs(): never {
+                throw new Error('getter broke');
+            },
+        };
+        const revoked = Proxy.revocable({}, {});
+        revoked.revoke();
+        for (const argument of [withGetter, revoked.proxy]) {
+            let bucket: Bucket | undefined;
+            expect(() => {
+                bucket = create(argument as never);
+            }).not.toThrow();
+            expect(bucket?.configError).toMatchObject({ code: 'INVALID_CONFIG', cause: expect.any(Error) });
+        }
+    });
+
+    it('lets a limiter resolve start() with INVALID_CONFIG for a bucket built from null', async () => {
+        const limiter = createLimiter<number, number>({
+            buckets: [createBucket(null as never)],
+            fetchJob: () => null,
+            processJob: (job) => ({ ok: true, data: job }),
+        });
+        expect(await limiter.start()).toMatchObject({
+            ok: false,
+            error: { code: 'INVALID_CONFIG' },
+        });
     });
 
     it('passes the reservation from reserve to settle', () => {
@@ -313,11 +448,59 @@ describe('checkBuckets', () => {
         full.reserve({}, 0);
         expect(checkBuckets([createBucketWaitingFor(500), full], { requests: 1 }, 0)).toEqual({
             ok: true,
-            data: { waitMs: 500, waitForChange: true },
+            data: { waitMs: 500, waitForChange: true, recheckMs: Number.POSITIVE_INFINITY },
         });
         expect(checkBuckets([full], { requests: 1 }, 0)).toEqual({
             ok: true,
-            data: { waitMs: 0, waitForChange: true },
+            data: { waitMs: 0, waitForChange: true, recheckMs: Number.POSITIVE_INFINITY },
+        });
+    });
+
+    describe('re-check delay while a sliding window waits for a change', () => {
+        /** Window of 100 tokens per second: 60 in flight since 0, 20 settled at 100 and 20 at 300. */
+        function createBusyWindow(): Bucket {
+            const window = createSlidingWindow({ tokens: 100, perMs: 1_000 });
+            window.reserve({ tokens: 60 }, 0);
+            book(window, { tokens: 20 }, 100);
+            book(window, { tokens: 20 }, 300);
+            return window;
+        }
+
+        it.each([
+            ['first settled booking makes room', 20, 400, 700],
+            ['both settled bookings must leave', 40, 400, 900],
+            ['no settled booking makes room alongside the in-flight one', 41, 400, Number.POSITIVE_INFINITY],
+        ])('%s', (_name, tokens, now, recheckMs) => {
+            const window = createBusyWindow();
+            expect(checkBuckets([window], { tokens }, now)).toEqual({
+                ok: true,
+                data: { waitMs: 0, waitForChange: true, recheckMs },
+            });
+            if (Number.isFinite(recheckMs)) {
+                // The hint is exact: one ms earlier the answer is unchanged, at the hint the cost fits.
+                expect(window.getWaitMs({ tokens }, now + recheckMs - 1)).toBe(WAIT_FOR_CHANGE);
+                expect(window.getWaitMs({ tokens }, now + recheckMs)).toBe(0);
+            }
+        });
+
+        it('combines the hint with other buckets: longest timed wait, none when another bucket needs a notification', () => {
+            const full = createConcurrencyBucket(1);
+            full.reserve({}, 0);
+            function check(buckets: Bucket[]) {
+                return checkBuckets(buckets, { tokens: 20 }, 400);
+            }
+            expect(check([createBusyWindow(), createBucketWaitingFor(5_000)])).toEqual({
+                ok: true,
+                data: { waitMs: 5_000, waitForChange: true, recheckMs: 5_000 },
+            });
+            expect(check([createBucketWaitingFor(50), createBusyWindow()])).toEqual({
+                ok: true,
+                data: { waitMs: 50, waitForChange: true, recheckMs: 700 },
+            });
+            expect(check([createBusyWindow(), full])).toEqual({
+                ok: true,
+                data: { waitMs: 0, waitForChange: true, recheckMs: Number.POSITIVE_INFINITY },
+            });
         });
     });
 
@@ -342,12 +525,15 @@ describe('checkBuckets', () => {
             ),
         ).toEqual({
             ok: true,
-            data: { waitMs: 20, waitForChange: false },
+            data: { waitMs: 20, waitForChange: false, recheckMs: 20 },
         });
     });
 
     it('returns 0 without buckets', () => {
-        expect(checkBuckets([], { requests: 1 }, 0)).toEqual({ ok: true, data: { waitMs: 0, waitForChange: false } });
+        expect(checkBuckets([], { requests: 1 }, 0)).toEqual({
+            ok: true,
+            data: { waitMs: 0, waitForChange: false, recheckMs: 0 },
+        });
     });
 
     it('reports COST_EXCEEDS_LIMIT when a bucket can never fit the cost', () => {
@@ -398,12 +584,15 @@ describe('tryReserveBuckets', () => {
         book(rpm, { requests: 1 }, 0);
 
         const result = tryReserveBuckets([concurrency, rpm], { requests: 1 }, 10_000);
-        expect(result).toEqual({ ok: true, data: { reserved: false, waitMs: 50_000, waitForChange: false } });
+        expect(result).toEqual({
+            ok: true,
+            data: { reserved: false, waitMs: 50_000, waitForChange: false, recheckMs: 50_000 },
+        });
         expect(concurrency.getWaitMs({ requests: 1 }, 10_000)).toBe(0);
         concurrency.reserve({}, 10_000);
         expect(tryReserveBuckets([concurrency], { requests: 1 }, 10_000)).toEqual({
             ok: true,
-            data: { reserved: false, waitMs: 0, waitForChange: true },
+            data: { reserved: false, waitMs: 0, waitForChange: true, recheckMs: Number.POSITIVE_INFINITY },
         });
     });
 

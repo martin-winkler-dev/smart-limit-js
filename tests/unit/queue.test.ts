@@ -2,7 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'bun:test';
-import { createQueue, createRPM, createTPM, type JobOutcome, type JobResult, type LogEntry } from '../../src/index.js';
+import {
+    createBucket,
+    createQueue,
+    createRPM,
+    createTPM,
+    type JobOutcome,
+    type JobResult,
+    type LogEntry,
+} from '../../src/index.js';
 import { createFakeClock, type FakeClock } from '../../src/testing.js';
 import { isObject } from '../../src/util.js';
 
@@ -324,9 +332,10 @@ describe('createQueue', () => {
             'released STOPPED',
             'released STOPPED',
         ]);
+        // 'late' belongs to the next run and is not part of this summary.
         expect(await clock.settle(stopped)).toEqual({
             ok: true,
-            data: { done: 1, failed: 0, released: 0, stoppedBy: 'stop' },
+            data: { done: 1, failed: 0, released: 2, stoppedBy: 'stop' },
         });
         expect(summary(await clock.settle(late))).toBe('done late');
         expect(summary(await clock.settle(queue.push('after')))).toBe('done after');
@@ -487,12 +496,12 @@ describe('createQueue', () => {
         });
         const a = queue.push('a');
         await clock.advance(100);
-        void queue.stop();
+        const firstStop = queue.stop();
         const b = queue.push('b');
-        expect(await clock.settle(queue.stop())).toEqual({
-            ok: true,
-            data: { done: 1, failed: 0, released: 0, stoppedBy: 'stop' },
-        });
+        const summaryOfRun = { ok: true, data: { done: 1, failed: 0, released: 1, stoppedBy: 'stop' } };
+        expect(await clock.settle(queue.stop())).toEqual(summaryOfRun);
+        // Both calls stop the same run.
+        expect(await firstStop).toEqual(summaryOfRun);
         expect((await Promise.all([a, b])).map(summary)).toEqual(['done a', 'released STOPPED']);
         await clock.advance(5_000);
         expect(started).toEqual(['a']);
@@ -519,7 +528,11 @@ describe('createQueue', () => {
         await clock.advance(0);
         expect(queue.getStatus().state).toBe('stopping');
         const c = queue.push('c');
-        await clock.settle(queue.stop());
+        // 'a' was released by the limiter, 'c' by the queue.
+        expect(await clock.settle(queue.stop())).toEqual({
+            ok: true,
+            data: { done: 1, failed: 0, released: 2, stoppedBy: 'max_wait_exceeded' },
+        });
         const outcomes = await clock.settle(Promise.all([a, b, c]));
         expect(outcomes.map(summary)).toEqual(['released MAX_WAIT_EXCEEDED', 'done b', 'released STOPPED']);
         expect(started).toEqual(['b', 'a']);
@@ -618,6 +631,150 @@ describe('createQueue', () => {
             expect(clock.activeTimers()).toBe(0);
         },
     );
+});
+
+describe('createQueue stop() summary', () => {
+    function createSlowQueue() {
+        const clock = createFakeClock();
+        const queue = createQueue<string, string>({
+            clock,
+            concurrency: 1,
+            processJob: async (job) => {
+                await sleep(clock, 1_000);
+                return { ok: true, data: job };
+            },
+        });
+        return { clock, queue };
+    }
+
+    it('accounts for every pushed job: done + failed + released equals the number of pushes', async () => {
+        const { clock, queue } = createSlowQueue();
+        const pushed = ['a', 'b', 'c', 'd', 'e'].map((job) => queue.push(job));
+        await clock.advance(10);
+        const result = await clock.settle(queue.stop());
+        expect(result).toEqual({ ok: true, data: { done: 1, failed: 0, released: 4, stoppedBy: 'stop' } });
+        expect((await Promise.all(pushed)).map(summary)).toEqual([
+            'done a',
+            'released STOPPED',
+            'released STOPPED',
+            'released STOPPED',
+            'released STOPPED',
+        ]);
+    });
+
+    it('counts a job aborted while it waits in the queue as released', async () => {
+        const { clock, queue } = createSlowQueue();
+        const controller = new AbortController();
+        const pushed = [queue.push('a'), queue.push('b', { signal: controller.signal }), queue.push('c')];
+        await clock.advance(10);
+        controller.abort();
+        const result = await clock.settle(queue.stop());
+        expect(result).toEqual({ ok: true, data: { done: 1, failed: 0, released: 2, stoppedBy: 'stop' } });
+        expect((await Promise.all(pushed)).map(summary)).toEqual(['done a', 'released ABORTED', 'released STOPPED']);
+    });
+
+    it('does not carry released jobs of an earlier run into a later summary', async () => {
+        const { clock, queue } = createSlowQueue();
+        const first = [queue.push('a'), queue.push('b')];
+        await clock.advance(10);
+        expect(await clock.settle(queue.stop())).toMatchObject({ data: { done: 1, released: 1 } });
+        await Promise.all(first);
+        // No run is active: nothing to release.
+        expect(await queue.stop()).toEqual({ ok: true, data: { done: 0, failed: 0, released: 0, stoppedBy: 'stop' } });
+        const second = [queue.push('c'), queue.push('d'), queue.push('e')];
+        await clock.advance(1_010);
+        expect(await clock.settle(queue.stop())).toEqual({
+            ok: true,
+            data: { done: 2, failed: 0, released: 1, stoppedBy: 'stop' },
+        });
+        expect((await Promise.all(second)).map(summary)).toEqual(['done c', 'done d', 'released STOPPED']);
+    });
+});
+
+describe('createQueue when the run fails', () => {
+    function createFailingQueue() {
+        const clock = createFakeClock();
+        const state = { isBroken: false };
+        const bucket = createBucket({
+            getWaitMs: () => {
+                if (state.isBroken) {
+                    throw new Error('bucket broke');
+                }
+                return 0;
+            },
+        });
+        const queue = createQueue<string, string>({
+            clock,
+            concurrency: 2,
+            buckets: [bucket],
+            processJob: async (job): Promise<JobResult<string>> => {
+                if (job === 'retry') {
+                    await sleep(clock, 100);
+                    return { ok: false, error: { type: 'retry_backoff', message: 'busy', retryAfterMs: 5_000 } };
+                }
+                if (job === 'slow') {
+                    await sleep(clock, 3_000);
+                    return { ok: false, error: { type: 'retry_backoff', message: 'busy', retryAfterMs: 5_000 } };
+                }
+                await sleep(clock, 1_000);
+                return { ok: true, data: job };
+            },
+        });
+        return { clock, state, queue };
+    }
+
+    it('resolves every unfinished push with the run error across buffered, in-flight, and waiting jobs', async () => {
+        const { clock, state, queue } = createFailingQueue();
+        const pushed = ['retry', 'slow', 'c', 'd', 'e'].map((job) => queue.push(job));
+        await clock.advance(500);
+        // 'retry' waits in the buffer for its retry, 'slow' and 'c' run, 'd' and 'e' wait in the queue.
+        expect(queue.getStatus()).toMatchObject({ running: 2, buffered: 1, waiting: 2 });
+        state.isBroken = true;
+        const outcomes = await clock.settle(Promise.all(pushed));
+        expect(outcomes.map(summary)).toEqual([
+            'released BUCKET_FAILED',
+            'released BUCKET_FAILED',
+            'done c',
+            'released BUCKET_FAILED',
+            'released BUCKET_FAILED',
+        ]);
+        for (const outcome of [outcomes[0], outcomes[1], outcomes[3]]) {
+            expect(!outcome.ok && outcome.error.cause).toEqual(new Error('bucket broke'));
+        }
+        expect(queue.getStatus()).toMatchObject({ state: 'idle', lastStoppedBy: 'error', waiting: 0 });
+    });
+
+    it('runs a job pushed while a failed run winds down in a new run, instead of failing it with the old error', async () => {
+        const { clock, state, queue } = createFailingQueue();
+        const running = queue.push('c');
+        await clock.advance(100);
+        state.isBroken = true;
+        const failed = queue.push('d');
+        await clock.advance(100);
+        expect(queue.getStatus()).toMatchObject({ state: 'stopping', running: 1 });
+        state.isBroken = false;
+        const late = queue.push('late');
+        expect((await clock.settle(Promise.all([running, failed, late]))).map(summary)).toEqual([
+            'done c',
+            'released BUCKET_FAILED',
+            'done late',
+        ]);
+        // 'c' finished at 1,000; 'late' ran in the next run.
+        expect(clock.now()).toBe(2_000);
+    });
+
+    it('reports STOPPED again for a stop() in the run after a failed one', async () => {
+        const { clock, state, queue } = createFailingQueue();
+        state.isBroken = true;
+        expect(summary(await clock.settle(queue.push('a')))).toBe('released BUCKET_FAILED');
+        state.isBroken = false;
+        const retry = queue.push('retry');
+        await clock.advance(200);
+        expect(queue.getStatus()).toMatchObject({ running: 0, buffered: 1 });
+        const result = await clock.settle(queue.stop());
+        expect(result).toEqual({ ok: true, data: { done: 0, failed: 0, released: 1, stoppedBy: 'stop' } });
+        expect(summary(await retry)).toBe('released STOPPED');
+    });
 });
 
 describe('createQueue priority', () => {
